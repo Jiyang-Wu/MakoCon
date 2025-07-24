@@ -1,0 +1,8 @@
+/mnt/c/Users/38381/Desktop/jw/mako_jw/mako_client/mako_server/target/debug/deps/makocon-5233afd4fd141c5a: src/main.rs /mnt/c/Users/38381/Desktop/jw/mako_jw/mako_client/mako_server/target/debug/build/makocon-53859405a5f62a48/out/autocxx-build-dir/rs/autocxx-ffi-default-gen.rs
+
+/mnt/c/Users/38381/Desktop/jw/mako_jw/mako_client/mako_server/target/debug/deps/makocon-5233afd4fd141c5a.d: src/main.rs /mnt/c/Users/38381/Desktop/jw/mako_jw/mako_client/mako_server/target/debug/build/makocon-53859405a5f62a48/out/autocxx-build-dir/rs/autocxx-ffi-default-gen.rs
+
+src/main.rs:
+/mnt/c/Users/38381/Desktop/jw/mako_jw/mako_client/mako_server/target/debug/build/makocon-53859405a5f62a48/out/autocxx-build-dir/rs/autocxx-ffi-default-gen.rs:
+
+# env-dep:OUT_DIR=/mnt/c/Users/38381/Desktop/jw/mako_jw/mako_client/mako_server/target/debug/build/makocon-53859405a5f62a48/out
