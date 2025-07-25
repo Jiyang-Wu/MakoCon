@@ -39,9 +39,6 @@ The system supports Redis-compatible commands with the format: `{operation}:{key
 ### Build Steps
 
 ```bash
-# 1. Build Rust library manually
-cargo build --release
-
 # Navigate to the mako directory
 cd mako
 

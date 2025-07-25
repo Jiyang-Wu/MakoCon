@@ -64,28 +64,10 @@ target_link_libraries(mako_server
 # Ensure Rust library is built before C++ executable
 add_dependencies(mako_server rust_lib)
 
-# Install targets
-install(TARGETS mako_server
-    RUNTIME DESTINATION bin
-)
-
 # Custom targets for convenience
 add_custom_target(clean_all
     COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target clean
     COMMAND cargo clean
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     COMMENT "Cleaning all build artifacts"
-)
-
-add_custom_target(test_server
-    COMMAND ./mako_server &
-    COMMAND sleep 2
-    COMMAND echo "Testing server with netcat..."
-    COMMAND echo -e "*3\\r\\n\\$3\\r\\nSET\\r\\n\\$8\\r\\ntest_key\\r\\n\\$10\\r\\ntest_value\\r\\n" | nc localhost 6380 || true
-    COMMAND echo -e "*2\\r\\n\\$3\\r\\nGET\\r\\n\\$8\\r\\ntest_key\\r\\n" | nc localhost 6380 || true
-    COMMAND pkill -f mako_server || true
-    DEPENDS mako_server
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-    COMMENT "Running basic server test"
-    VERBATIM
 )
