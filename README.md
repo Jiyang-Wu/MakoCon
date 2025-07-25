@@ -41,6 +41,7 @@ The system supports Redis-compatible commands with the format: `{operation}:{key
 ```bash
 # Navigate to the mako directory
 cd mako
+rm -rf build target
 
 # Create build directory and configure
 mkdir build
