@@ -1,45 +1,33 @@
-#ifndef MAKO_KV_STORE_H
-#define MAKO_KV_STORE_H
+#ifndef _KV_STORE_H_
+#define _KV_STORE_H_
 
-#include <iostream>
 #include <string>
 #include <map>
-#include <thread>
-#include <chrono>
-#include <atomic>
+#include <utility>
 
-using namespace std;
-
-// C interface for Rust functions
-extern "C" {
-    bool rust_init();
-    bool rust_retrieve_request_from_queue(uint32_t* id, char** operation, char** key, char** value);
-    bool rust_put_response_back_queue(uint32_t id, const char* result, bool success);
-    void rust_free_string(char* ptr);
-}
-
-class MakoKVStore {
+class KVStore {
 public:
-    MakoKVStore();
-    ~MakoKVStore();
+    KVStore();
+    ~KVStore();
     
-    bool init();
-    void start_polling();
-    void stop();
+    struct Result {
+        std::string value;
+        bool success;
+        
+        Result(const std::string& val, bool succ) : value(val), success(succ) {}
+        Result(bool succ) : value(""), success(succ) {}
+    };
+    
+    Result get(const std::string& key) const;
+    Result set(const std::string& key, const std::string& value);
+    Result execute_operation(const std::string& operation, const std::string& key, const std::string& value);
+    
+    size_t size() const;
+    bool empty() const;
+    void clear();
     
 private:
-    void poll_requests();
-    void execute_request(uint32_t id, const string& operation, const string& key, const string& value);
-    
-    // Core storage
     std::map<std::string, std::string> store_;
-    
-    // Control flags
-    std::atomic<bool> running_;
-    std::atomic<bool> initialized_;
-    
-    // Polling thread
-    std::thread polling_thread_;
 };
 
 #endif

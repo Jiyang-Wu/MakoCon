@@ -1,13 +1,13 @@
-#include "kv_store.h"
+#include "rust_wrapper.h"
 
-MakoKVStore::MakoKVStore() : running_(false), initialized_(false) {
+RustWrapper::RustWrapper() : running_(false), initialized_(false) {
 }
 
-MakoKVStore::~MakoKVStore() {
+RustWrapper::~RustWrapper() {
     stop();
 }
 
-bool MakoKVStore::init() {
+bool RustWrapper::init() {
     if (initialized_) {
         return false; // Already initialized
     }
@@ -21,20 +21,20 @@ bool MakoKVStore::init() {
     running_ = true;
     initialized_ = true;
     
-    std::cout << "MakoKVStore initialized successfully" << std::endl;
+    std::cout << "RustWrapper initialized successfully" << std::endl;
     return true;
 }
 
-void MakoKVStore::start_polling() {
+void RustWrapper::start_polling() {
     if (!initialized_ || polling_thread_.joinable()) {
         return;
     }
     
-    polling_thread_ = std::thread(&MakoKVStore::poll_requests, this);
+    polling_thread_ = std::thread(&RustWrapper::poll_requests, this);
     std::cout << "Started polling thread for request processing" << std::endl;
 }
 
-void MakoKVStore::stop() {
+void RustWrapper::stop() {
     if (running_) {
         running_ = false;
         if (polling_thread_.joinable()) {
@@ -43,7 +43,7 @@ void MakoKVStore::stop() {
     }
 }
 
-void MakoKVStore::poll_requests() {
+void RustWrapper::poll_requests() {
     long int counter = 0;
     
     while (running_) {
@@ -79,28 +79,11 @@ void MakoKVStore::poll_requests() {
     }
 }
 
-void MakoKVStore::execute_request(uint32_t id, const string& operation, const string& key, const string& value) {
-    string result;
-    bool success = true;
-    
-    if (operation == "get") {
-        auto it = store_.find(key);
-        if (it != store_.end()) {
-            result = it->second;
-        } else {
-            result = ""; // Key not found
-            success = false;
-        }
-    } else if (operation == "set") {
-        store_[key] = value;
-        result = "OK";
-    } else {
-        result = "ERROR: Invalid operation";
-        success = false;
-    }
+void RustWrapper::execute_request(uint32_t id, const string& operation, const string& key, const string& value) {
+    KVStore::Result result = kv_store_.execute_operation(operation, key, value);
     
     // Send response back to Rust
-    rust_put_response_back_queue(id, result.c_str(), success);
+    rust_put_response_back_queue(id, result.value.c_str(), result.success);
     
-    std::cout << "Executed " << operation << " for key '" << key << "' -> " << result << std::endl;
+    std::cout << "Executed " << operation << " for key '" << key << "' -> " << result.value << std::endl;
 }

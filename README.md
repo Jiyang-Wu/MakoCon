@@ -39,16 +39,14 @@ The system supports Redis-compatible commands with the format: `{operation}:{key
 ### Build Steps
 
 ```bash
-# Navigate to the mako directory
-cd mako
-rm -rf build target
-
 # Create build directory and configure
-mkdir build
+cd mako
+rm -rf build
+mkdir -p build
 cd build
 cmake ..
-
 make -j$(nproc)
+cd ../
 ```
 
 ### Start the Server

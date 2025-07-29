@@ -1,12 +1,12 @@
-#include "kv_store.h"
+#include "rust_wrapper.h"
 #include <iostream>
 #include <signal.h>
 
-MakoKVStore* g_kv_store = nullptr;
+RustWrapper* g_kv_store = nullptr;
 
 void signal_handler(int signal) {
     if (g_kv_store) {
-        std::cout << "\nShutting down MakoKVStore..." << std::endl;
+        std::cout << "\nShutting down RustWrapper..." << std::endl;
         g_kv_store->stop();
         delete g_kv_store;
         g_kv_store = nullptr;
@@ -22,7 +22,7 @@ int main() {
     std::cout << "Starting Mako KV Store..." << std::endl;
     
     // Create and initialize KV store
-    g_kv_store = new MakoKVStore();
+    g_kv_store = new RustWrapper();
     
     if (!g_kv_store->init()) {
         std::cerr << "Failed to initialize KV store" << std::endl;

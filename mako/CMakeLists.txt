@@ -40,10 +40,12 @@ add_dependencies(rust_lib rust_build)
 # Source files
 set(SOURCES
     src/main.cpp
-    src/kv_store.cpp
+    src/rust_wrapper.cc
+    src/kv_store.cc
 )
 
 set(HEADERS
+    src/rust_wrapper.h
     src/kv_store.h
 )
 
