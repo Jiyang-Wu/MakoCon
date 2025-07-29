@@ -1,4 +1,4 @@
-*/target/*
+target
 *.a
 *.so
 *.o
@@ -7,3 +7,4 @@ settings.json
 */build/*
 mako_server
 test_kv
+
