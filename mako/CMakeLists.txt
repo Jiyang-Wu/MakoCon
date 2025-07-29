@@ -19,13 +19,13 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O2 -Wall -Wextra -DNDEBUG")
 find_package(Threads REQUIRED)
 
 # Rust library path
-set(RUST_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/target/release")
+set(RUST_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/rust-lib/target/release")
 set(RUST_LIB_NAME "mako")
 
 # Custom target to build Rust library
 add_custom_target(rust_build ALL
     COMMAND cargo build --release
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/rust-lib
     COMMENT "Building Rust library"
     VERBATIM
 )
@@ -68,6 +68,6 @@ add_dependencies(mako_server rust_lib)
 add_custom_target(clean_all
     COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target clean
     COMMAND cargo clean
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/rust-lib
     COMMENT "Cleaning all build artifacts"
 )
