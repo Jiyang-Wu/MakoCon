@@ -157,10 +157,12 @@ fn handle_client(
                     
                     let request = RustRequest {
                         id: req_id,
-                        operation: parsed_request.0,
+                        operation: parsed_request.0.clone(),
                         key: parsed_request.1,
                         value: parsed_request.2,
                     };
+                    
+                    let operation = parsed_request.0.clone(); // Keep a copy before moving request
                     
                     // Add to request queue
                     {
@@ -172,7 +174,82 @@ fn handle_client(
                     let response = wait_for_response(&response_queue, req_id);
                     
                     // Send response back to client
-                    let response_str = if response.success {
+                    let response_str = if operation == "ping" {
+                        "+PONG\r\n".to_string() // Simple string response for PING
+                    } else if operation == "keys" && response.success {
+                        // Array response for KEYS command
+                        if response.result.is_empty() {
+                            "*0\r\n".to_string() // Empty array
+                        } else {
+                            let keys: Vec<&str> = response.result.split(',').collect();
+                            let mut result = format!("*{}\r\n", keys.len());
+                            for key in keys {
+                                result.push_str(&format!("${}\r\n{}\r\n", key.len(), key));
+                            }
+                            result
+                        }
+                    } else if operation == "hgetall" && response.success {
+                        // Array response for HGETALL command (field1, value1, field2, value2, ...)
+                        if response.result.is_empty() {
+                            "*0\r\n".to_string() // Empty array
+                        } else {
+                            let pairs: Vec<&str> = response.result.split(',').collect();
+                            let mut result = format!("*{}\r\n", pairs.len() * 2); // Each pair becomes 2 elements
+                            for pair in pairs {
+                                if let Some(colon_pos) = pair.find(':') {
+                                    let field = &pair[..colon_pos];
+                                    let value = &pair[colon_pos + 1..];
+                                    result.push_str(&format!("${}\r\n{}\r\n", field.len(), field));
+                                    result.push_str(&format!("${}\r\n{}\r\n", value.len(), value));
+                                }
+                            }
+                            result
+                        }
+                    } else if operation == "hmget" && response.success {
+                        // Array response for HMGET command
+                        if response.result.is_empty() {
+                            "*0\r\n".to_string() // Empty array
+                        } else {
+                            let values: Vec<&str> = response.result.split(',').collect();
+                            let mut result = format!("*{}\r\n", values.len());
+                            for value in values {
+                                if value == "NULL" {
+                                    result.push_str("$-1\r\n"); // NULL bulk string
+                                } else {
+                                    result.push_str(&format!("${}\r\n{}\r\n", value.len(), value));
+                                }
+                            }
+                            result
+                        }
+                    } else if operation == "smembers" || operation == "sinter" || operation == "sdiff" {
+                        // Array response for set operations that return multiple values
+                        if response.success {
+                            if response.result.is_empty() {
+                                "*0\r\n".to_string() // Empty array
+                            } else {
+                                let members: Vec<&str> = response.result.split(',').collect();
+                                let mut result = format!("*{}\r\n", members.len());
+                                for member in members {
+                                    result.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
+                                }
+                                result
+                            }
+                        } else {
+                            "*0\r\n".to_string() // Empty array on error
+                        }
+                    } else if operation == "exists" || operation == "expire" || operation == "ttl" || 
+                              operation == "llen" || operation == "lpush" || operation == "rpush" ||
+                              operation == "incr" || operation == "decr" || operation == "incrby" || 
+                              operation == "decrby" || operation == "del" || operation == "hset" ||
+                              operation == "hdel" || operation == "hexists" || operation == "sadd" ||
+                              operation == "sismember" || operation == "scard" {
+                        // Integer response for commands that return numbers
+                        if response.success {
+                            format!(":{}\r\n", response.result)
+                        } else {
+                            "-ERR command failed\r\n".to_string()
+                        }
+                    } else if response.success {
                         if response.result.is_empty() {
                             "$-1\r\n".to_string() // NULL bulk string
                         } else {
@@ -230,6 +307,316 @@ fn parse_resp3_command(decoded: DecodedFrame<BytesFrame>) -> Option<(String, Str
                 let key_string = String::from_utf8_lossy(key).to_string();
                 let val_string = String::from_utf8_lossy(val).to_string();
                 Some(("set".to_string(), key_string, val_string))
+            } else {
+                None
+            }
+        }
+        // Numeric operations
+        "INCR" if parts.len() >= 2 => {
+            if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
+                let key_string = String::from_utf8_lossy(key).to_string();
+                Some(("incr".to_string(), key_string, String::new()))
+            } else {
+                None
+            }
+        }
+        "DECR" if parts.len() >= 2 => {
+            if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
+                let key_string = String::from_utf8_lossy(key).to_string();
+                Some(("decr".to_string(), key_string, String::new()))
+            } else {
+                None
+            }
+        }
+        "INCRBY" if parts.len() >= 3 => {
+            if let (BytesFrame::BlobString { data: key, .. },
+                    BytesFrame::BlobString { data: val, .. }) =
+                    (&parts[1], &parts[2]) {
+                let key_string = String::from_utf8_lossy(key).to_string();
+                let val_string = String::from_utf8_lossy(val).to_string();
+                Some(("incrby".to_string(), key_string, val_string))
+            } else {
+                None
+            }
+        }
+        "DECRBY" if parts.len() >= 3 => {
+            if let (BytesFrame::BlobString { data: key, .. },
+                    BytesFrame::BlobString { data: val, .. }) =
+                    (&parts[1], &parts[2]) {
+                let key_string = String::from_utf8_lossy(key).to_string();
+                let val_string = String::from_utf8_lossy(val).to_string();
+                Some(("decrby".to_string(), key_string, val_string))
+            } else {
+                None
+            }
+        }
+        // List operations
+        "LPUSH" if parts.len() >= 3 => {
+            if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
+                let key_string = String::from_utf8_lossy(key).to_string();
+                // Collect all values after the key
+                let mut values = Vec::new();
+                for part in &parts[2..] {
+                    if let BytesFrame::BlobString { data: val, .. } = part {
+                        values.push(String::from_utf8_lossy(val).to_string());
+                    }
+                }
+                if !values.is_empty() {
+                    let val_string = values.join(","); // Join multiple values with comma
+                    Some(("lpush".to_string(), key_string, val_string))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        "RPUSH" if parts.len() >= 3 => {
+            if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
+                let key_string = String::from_utf8_lossy(key).to_string();
+                // Collect all values after the key
+                let mut values = Vec::new();
+                for part in &parts[2..] {
+                    if let BytesFrame::BlobString { data: val, .. } = part {
+                        values.push(String::from_utf8_lossy(val).to_string());
+                    }
+                }
+                if !values.is_empty() {
+                    let val_string = values.join(","); // Join multiple values with comma
+                    Some(("rpush".to_string(), key_string, val_string))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        "LPOP" if parts.len() >= 2 => {
+            if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
+                let key_string = String::from_utf8_lossy(key).to_string();
+                Some(("lpop".to_string(), key_string, String::new()))
+            } else {
+                None
+            }
+        }
+        "RPOP" if parts.len() >= 2 => {
+            if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
+                let key_string = String::from_utf8_lossy(key).to_string();
+                Some(("rpop".to_string(), key_string, String::new()))
+            } else {
+                None
+            }
+        }
+        "LLEN" if parts.len() >= 2 => {
+            if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
+                let key_string = String::from_utf8_lossy(key).to_string();
+                Some(("llen".to_string(), key_string, String::new()))
+            } else {
+                None
+            }
+        }
+        "LRANGE" if parts.len() >= 4 => {
+            if let (BytesFrame::BlobString { data: key, .. },
+                    BytesFrame::BlobString { data: start, .. },
+                    BytesFrame::BlobString { data: stop, .. }) =
+                    (&parts[1], &parts[2], &parts[3]) {
+                let key_string = String::from_utf8_lossy(key).to_string();
+                let start_str = String::from_utf8_lossy(start).to_string();
+                let stop_str = String::from_utf8_lossy(stop).to_string();
+                let range_str = format!("{},{}", start_str, stop_str);
+                Some(("lrange".to_string(), key_string, range_str))
+            } else {
+                None
+            }
+        }
+        // Hash operations
+        "HSET" if parts.len() >= 4 => {
+            if let (BytesFrame::BlobString { data: key, .. },
+                    BytesFrame::BlobString { data: field, .. },
+                    BytesFrame::BlobString { data: val, .. }) =
+                    (&parts[1], &parts[2], &parts[3]) {
+                let key_string = String::from_utf8_lossy(key).to_string();
+                let field_string = String::from_utf8_lossy(field).to_string();
+                let val_string = String::from_utf8_lossy(val).to_string();
+                let combined = format!("{}:{}", field_string, val_string);
+                Some(("hset".to_string(), key_string, combined))
+            } else {
+                None
+            }
+        }
+        "HGET" if parts.len() >= 3 => {
+            if let (BytesFrame::BlobString { data: key, .. },
+                    BytesFrame::BlobString { data: field, .. }) =
+                    (&parts[1], &parts[2]) {
+                let key_string = String::from_utf8_lossy(key).to_string();
+                let field_string = String::from_utf8_lossy(field).to_string();
+                Some(("hget".to_string(), key_string, field_string))
+            } else {
+                None
+            }
+        }
+        "HGETALL" if parts.len() >= 2 => {
+            if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
+                let key_string = String::from_utf8_lossy(key).to_string();
+                Some(("hgetall".to_string(), key_string, String::new()))
+            } else {
+                None
+            }
+        }
+        "HDEL" if parts.len() >= 3 => {
+            if let (BytesFrame::BlobString { data: key, .. },
+                    BytesFrame::BlobString { data: field, .. }) =
+                    (&parts[1], &parts[2]) {
+                let key_string = String::from_utf8_lossy(key).to_string();
+                let field_string = String::from_utf8_lossy(field).to_string();
+                Some(("hdel".to_string(), key_string, field_string))
+            } else {
+                None
+            }
+        }
+        "HEXISTS" if parts.len() >= 3 => {
+            if let (BytesFrame::BlobString { data: key, .. },
+                    BytesFrame::BlobString { data: field, .. }) =
+                    (&parts[1], &parts[2]) {
+                let key_string = String::from_utf8_lossy(key).to_string();
+                let field_string = String::from_utf8_lossy(field).to_string();
+                Some(("hexists".to_string(), key_string, field_string))
+            } else {
+                None
+            }
+        }
+        "HMGET" if parts.len() >= 3 => {
+            if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
+                let key_string = String::from_utf8_lossy(key).to_string();
+                // Collect all field names after the key
+                let mut fields = Vec::new();
+                for part in &parts[2..] {
+                    if let BytesFrame::BlobString { data: field, .. } = part {
+                        fields.push(String::from_utf8_lossy(field).to_string());
+                    }
+                }
+                if !fields.is_empty() {
+                    let fields_string = fields.join(",");
+                    Some(("hmget".to_string(), key_string, fields_string))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        "PING" => {
+            Some(("ping".to_string(), String::new(), String::new()))
+        }
+        "DEL" if parts.len() >= 2 => {
+            if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
+                let key_string = String::from_utf8_lossy(key).to_string();
+                Some(("del".to_string(), key_string, String::new()))
+            } else {
+                None
+            }
+        }
+        "EXISTS" if parts.len() >= 2 => {
+            if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
+                let key_string = String::from_utf8_lossy(key).to_string();
+                Some(("exists".to_string(), key_string, String::new()))
+            } else {
+                None
+            }
+        }
+        "EXPIRE" if parts.len() >= 3 => {
+            if let (BytesFrame::BlobString { data: key, .. },
+                    BytesFrame::BlobString { data: ttl, .. }) =
+                    (&parts[1], &parts[2]) {
+                let key_string = String::from_utf8_lossy(key).to_string();
+                let ttl_string = String::from_utf8_lossy(ttl).to_string();
+                Some(("expire".to_string(), key_string, ttl_string))
+            } else {
+                None
+            }
+        }
+        "TTL" if parts.len() >= 2 => {
+            if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
+                let key_string = String::from_utf8_lossy(key).to_string();
+                Some(("ttl".to_string(), key_string, String::new()))
+            } else {
+                None
+            }
+        }
+        "KEYS" if parts.len() >= 2 => {
+            if let BytesFrame::BlobString { data: pattern, .. } = &parts[1] {
+                let pattern_string = String::from_utf8_lossy(pattern).to_string();
+                Some(("keys".to_string(), pattern_string, String::new()))
+            } else {
+                None
+            }
+        }
+        // Set operations
+        "SADD" if parts.len() >= 3 => {
+            if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
+                let key_string = String::from_utf8_lossy(key).to_string();
+                // Collect all values after the key
+                let mut values = Vec::new();
+                for part in &parts[2..] {
+                    if let BytesFrame::BlobString { data: val, .. } = part {
+                        values.push(String::from_utf8_lossy(val).to_string());
+                    }
+                }
+                if !values.is_empty() {
+                    let val_string = values.join(",");
+                    Some(("sadd".to_string(), key_string, val_string))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        "SMEMBERS" if parts.len() >= 2 => {
+            if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
+                let key_string = String::from_utf8_lossy(key).to_string();
+                Some(("smembers".to_string(), key_string, String::new()))
+            } else {
+                None
+            }
+        }
+        "SISMEMBER" if parts.len() >= 3 => {
+            if let (BytesFrame::BlobString { data: key, .. },
+                    BytesFrame::BlobString { data: member, .. }) =
+                    (&parts[1], &parts[2]) {
+                let key_string = String::from_utf8_lossy(key).to_string();
+                let member_string = String::from_utf8_lossy(member).to_string();
+                Some(("sismember".to_string(), key_string, member_string))
+            } else {
+                None
+            }
+        }
+        "SINTER" if parts.len() >= 3 => {
+            if let (BytesFrame::BlobString { data: key1, .. },
+                    BytesFrame::BlobString { data: key2, .. }) =
+                    (&parts[1], &parts[2]) {
+                let key1_string = String::from_utf8_lossy(key1).to_string();
+                let key2_string = String::from_utf8_lossy(key2).to_string();
+                Some(("sinter".to_string(), key1_string, key2_string))
+            } else {
+                None
+            }
+        }
+        "SDIFF" if parts.len() >= 3 => {
+            if let (BytesFrame::BlobString { data: key1, .. },
+                    BytesFrame::BlobString { data: key2, .. }) =
+                    (&parts[1], &parts[2]) {
+                let key1_string = String::from_utf8_lossy(key1).to_string();
+                let key2_string = String::from_utf8_lossy(key2).to_string();
+                Some(("sdiff".to_string(), key1_string, key2_string))
+            } else {
+                None
+            }
+        }
+        "SCARD" if parts.len() >= 2 => {
+            if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
+                let key_string = String::from_utf8_lossy(key).to_string();
+                Some(("scard".to_string(), key_string, String::new()))
             } else {
                 None
             }
