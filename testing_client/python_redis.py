@@ -199,9 +199,26 @@ def key_management():
         print(f"Delete not supported: {e}")
 
 
-def transaction_operations():
-    print("\n--- Transaction Operations ---")
+def transaction_operations_1():
+    # Example with direct MULTI/EXEC (no pipeline)
     try:
+        print("\n--- Direct MULTI/EXEC (no pipeline) ---")
+        r.execute_command("MULTI")
+        r.execute_command("SET", "direct:key1", "value1")
+        r.execute_command("SET", "direct:key2", "value2")
+        r.execute_command("INCR", "direct:counter")
+        r.execute_command("INCR", "direct:counter")
+        results = r.execute_command("EXEC")
+        print(f"Direct MULTI/EXEC results: {results}")
+        print("direct:counter: ", r.get("direct:counter"))
+        
+    except Exception as e:
+        print(f"Direct MULTI/EXEC not supported: {e}")
+
+
+def transaction_operations_2():
+    try:
+        print("\n--- Transactions with pipeline ---")
         # Start a transaction
         pipe = r.pipeline()
         
@@ -222,7 +239,9 @@ def transaction_operations():
         
     except Exception as e:
         print(f"Transaction operations not supported: {e}")
-        
+
+
+def transaction_operations_3():
     # Example with MULTI/EXEC (alternative approach)
     try:
         print("\n--- MULTI/EXEC Transaction ---")
@@ -238,7 +257,9 @@ def transaction_operations():
         
     except Exception as e:
         print(f"MULTI/EXEC not supported: {e}")
-        
+
+
+def transaction_operations_4():
     # Example with WATCH (optimistic locking)
     try:
         print("\n--- WATCH Transaction ---")
@@ -269,31 +290,17 @@ def transaction_operations():
             r.unwatch()
         except:
             pass
-    
-    # Example with direct MULTI/EXEC (no pipeline)
-    try:
-        print("\n--- Direct MULTI/EXEC (no pipeline) ---")
-        r.execute_command("MULTI")
-        r.execute_command("SET", "direct:key1", "value1")
-        r.execute_command("SET", "direct:key2", "value2")
-        r.execute_command("INCR", "direct:counter")
-        r.execute_command("INCR", "direct:counter")
-        results = r.execute_command("EXEC")
-        print(f"Direct MULTI/EXEC results: {results}")
-        print("direct:counter: ", r.get("direct:counter"))
-        
-    except Exception as e:
-        print(f"Direct MULTI/EXEC not supported: {e}")
 
 
 if __name__ == "__main__":
+    cleanup_redis()
     basic_set_and_get()
     numeric_operations()
     list_operations()
     key_management()
     hash_operations()
     set_operations()
-
-    # it's hard to implement! Regular expression + Transaction!
-    # cleanup_redis()
-    # transaction_operations()
+    transaction_operations_1()
+    transaction_operations_2()
+    transaction_operations_3()
+    transaction_operations_4()

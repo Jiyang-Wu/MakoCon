@@ -84,18 +84,39 @@ The system uses a hybrid Rust-C++ architecture:
 - `KEYS pattern` - Find keys matching pattern  
   **Implementation:** iterates through all data structures using `std::regex` to match pattern against key names
 
+### ✅ Transaction Commands (Sequential Execution)
+- `MULTI` - Start transaction block  
+  **Implementation:** begins command queuing, returns "OK"
+- `EXEC` - Execute transaction  
+  **Implementation:** executes all queued commands in order, returns array of results
+- `DISCARD` - Discard transaction  
+  **Implementation:** clears command queue, returns "OK"
+- `WATCH key` - Watch key for changes  
+  **Implementation:** returns "OK" (no actual monitoring, for client compatibility)
+- `UNWATCH` - Stop watching keys  
+  **Implementation:** returns "OK" (no actual unwatching needed)
+
+**Transaction Behavior:**
+- Commands between MULTI and EXEC are queued and return "+QUEUED"
+- EXEC processes all queued commands sequentially and returns an array of results
+- Pipeline transactions work with Redis clients (redis-py pipelines)
+- No true atomicity: commands execute in order but are not atomic as a unit
+
+### ✅ Pipeline Support
+- Redis client pipelines are supported for batching commands
+- Compatible with redis-py `pipeline()` usage patterns
+- Supports both explicit MULTI/EXEC transactions and implicit pipelining
+
 
 ## ❌ Unsupported Features
 
-### Transaction Operations
-- `MULTI` / `EXEC` / `DISCARD`
-- `WATCH` / `UNWATCH`
+### True Atomic Transactions
+**Note:** Transaction commands provide sequential execution only, not true atomicity. Commands in a transaction execute in order but individual command failures don't roll back the entire transaction.
 
-**Why not supported:**
-- Requires significant architectural changes to queue commands instead of immediate execution
-- Current design processes each command synchronously through the Rust-C++ bridge
-- Would need transaction state management across the request-response queue system
-- Redis transactions require atomic execution of command batches, which conflicts with the current single-command processing model
+**Limitations:**
+- No rollback on partial transaction failure
+- No isolation between concurrent transactions
+- WATCH doesn't actually monitor key changes (returns OK for compatibility)
 
 ### Other Unsupported Features
 - **Pub/Sub** - Requires persistent connection state and message broadcasting

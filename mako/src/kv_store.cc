@@ -132,6 +132,16 @@ KVStore::Result KVStore::execute_operation(const std::string& operation, const s
         return sdiff(key, value); // value is the second key
     } else if (operation == "scard") {
         return scard(key);
+    } else if (operation == "multi") {
+        return Result("OK", true); // Just acknowledge, no state change needed
+    } else if (operation == "exec") {
+        return Result("OK", true); // Just acknowledge, commands executed sequentially
+    } else if (operation == "discard") {
+        return Result("OK", true); // Just acknowledge, nothing to discard
+    } else if (operation == "watch") {
+        return Result("OK", true); // Just acknowledge, no actual watching
+    } else if (operation == "unwatch") {
+        return Result("OK", true); // Just acknowledge, no actual unwatching
     } else {
         return Result("ERROR: Invalid operation", false);
     }

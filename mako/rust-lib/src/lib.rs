@@ -142,6 +142,8 @@ fn handle_client(
 ) -> std::io::Result<()> {
     let mut resp3 = Resp3Handler::new(4096);
     let mut read_buf = [0u8; 4096];
+    let mut pipeline_buffer: Vec<RustRequest> = Vec::new();
+    let mut in_transaction = false;
     
     loop {
         match stream.read(&mut read_buf) {
@@ -150,6 +152,7 @@ fn handle_client(
             Err(e) => return Err(e),
         }
         
+        // Process frames one by one but handle batching intelligently
         while let Ok(opt) = resp3.next_frame() {
             if let Some(frame) = opt {
                 if let Some(parsed_request) = parse_resp3_command(frame) {
@@ -162,104 +165,60 @@ fn handle_client(
                         value: parsed_request.2,
                     };
                     
-                    let operation = parsed_request.0.clone(); // Keep a copy before moving request
+                    let operation = parsed_request.0.clone();
                     
-                    // Add to request queue
-                    {
-                        let mut queue = request_queue.lock().unwrap();
-                        queue.push_back(request);
+                    // Handle transaction commands
+                    if operation == "multi" {
+                        in_transaction = true;
+                        pipeline_buffer.clear();
+                        stream.write_all(b"+OK\r\n")?;
+                        continue;
+                    } else if operation == "exec" {
+                        in_transaction = false;
+                        // Process all commands in pipeline_buffer and return array
+                        let mut exec_responses = Vec::new();
+                        for buffered_request in &pipeline_buffer {
+                            let mut queue = request_queue.lock().unwrap();
+                            queue.push_back(buffered_request.clone());
+                            drop(queue);
+                            
+                            let response = wait_for_response(&response_queue, buffered_request.id);
+                            exec_responses.push(response);
+                        }
+                        pipeline_buffer.clear();
+                        
+                        // Send array response for EXEC
+                        let exec_response_str = format_exec_response(exec_responses);
+                        stream.write_all(exec_response_str.as_bytes())?;
+                        continue;
+                    } else if operation == "discard" {
+                        in_transaction = false;
+                        pipeline_buffer.clear();
+                        stream.write_all(b"+OK\r\n")?;
+                        continue;
+                    } else if operation == "watch" {
+                        stream.write_all(b"+OK\r\n")?;
+                        continue;
+                    } else if operation == "unwatch" {
+                        stream.write_all(b"+OK\r\n")?;
+                        continue;
                     }
                     
-                    // Wait for response
-                    let response = wait_for_response(&response_queue, req_id);
-                    
-                    // Send response back to client
-                    let response_str = if operation == "ping" {
-                        "+PONG\r\n".to_string() // Simple string response for PING
-                    } else if operation == "keys" && response.success {
-                        // Array response for KEYS command
-                        if response.result.is_empty() {
-                            "*0\r\n".to_string() // Empty array
-                        } else {
-                            let keys: Vec<&str> = response.result.split(',').collect();
-                            let mut result = format!("*{}\r\n", keys.len());
-                            for key in keys {
-                                result.push_str(&format!("${}\r\n{}\r\n", key.len(), key));
-                            }
-                            result
-                        }
-                    } else if operation == "hgetall" && response.success {
-                        // Array response for HGETALL command (field1, value1, field2, value2, ...)
-                        if response.result.is_empty() {
-                            "*0\r\n".to_string() // Empty array
-                        } else {
-                            let pairs: Vec<&str> = response.result.split(',').collect();
-                            let mut result = format!("*{}\r\n", pairs.len() * 2); // Each pair becomes 2 elements
-                            for pair in pairs {
-                                if let Some(colon_pos) = pair.find(':') {
-                                    let field = &pair[..colon_pos];
-                                    let value = &pair[colon_pos + 1..];
-                                    result.push_str(&format!("${}\r\n{}\r\n", field.len(), field));
-                                    result.push_str(&format!("${}\r\n{}\r\n", value.len(), value));
-                                }
-                            }
-                            result
-                        }
-                    } else if operation == "hmget" && response.success {
-                        // Array response for HMGET command
-                        if response.result.is_empty() {
-                            "*0\r\n".to_string() // Empty array
-                        } else {
-                            let values: Vec<&str> = response.result.split(',').collect();
-                            let mut result = format!("*{}\r\n", values.len());
-                            for value in values {
-                                if value == "NULL" {
-                                    result.push_str("$-1\r\n"); // NULL bulk string
-                                } else {
-                                    result.push_str(&format!("${}\r\n{}\r\n", value.len(), value));
-                                }
-                            }
-                            result
-                        }
-                    } else if operation == "smembers" || operation == "sinter" || operation == "sdiff" {
-                        // Array response for set operations that return multiple values
-                        if response.success {
-                            if response.result.is_empty() {
-                                "*0\r\n".to_string() // Empty array
-                            } else {
-                                let members: Vec<&str> = response.result.split(',').collect();
-                                let mut result = format!("*{}\r\n", members.len());
-                                for member in members {
-                                    result.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
-                                }
-                                result
-                            }
-                        } else {
-                            "*0\r\n".to_string() // Empty array on error
-                        }
-                    } else if operation == "exists" || operation == "expire" || operation == "ttl" || 
-                              operation == "llen" || operation == "lpush" || operation == "rpush" ||
-                              operation == "incr" || operation == "decr" || operation == "incrby" || 
-                              operation == "decrby" || operation == "del" || operation == "hset" ||
-                              operation == "hdel" || operation == "hexists" || operation == "sadd" ||
-                              operation == "sismember" || operation == "scard" {
-                        // Integer response for commands that return numbers
-                        if response.success {
-                            format!(":{}\r\n", response.result)
-                        } else {
-                            "-ERR command failed\r\n".to_string()
-                        }
-                    } else if response.success {
-                        if response.result.is_empty() {
-                            "$-1\r\n".to_string() // NULL bulk string
-                        } else {
-                            format!("${}\r\n{}\r\n", response.result.len(), response.result)
-                        }
+                    // If in transaction, buffer the command and send QUEUED
+                    if in_transaction {
+                        pipeline_buffer.push(request);
+                        stream.write_all(b"+QUEUED\r\n")?;
                     } else {
-                        "-ERR not found\r\n".to_string()
-                    };
-                    
-                    stream.write_all(response_str.as_bytes())?;
+                        // Process command immediately
+                        {
+                            let mut queue = request_queue.lock().unwrap();
+                            queue.push_back(request);
+                        }
+                        
+                        let response = wait_for_response(&response_queue, req_id);
+                        let response_str = format_response(&operation, &response);
+                        stream.write_all(response_str.as_bytes())?;
+                    }
                 } else {
                     stream.write_all(b"-ERR invalid command format\r\n")?;
                 }
@@ -270,6 +229,120 @@ fn handle_client(
     }
     
     Ok(())
+}
+
+fn format_exec_response(responses: Vec<RustResponse>) -> String {
+    let mut result = format!("*{}\r\n", responses.len());
+    for response in responses {
+        if response.success {
+            if response.result.is_empty() {
+                result.push_str("$-1\r\n"); // NULL
+            } else {
+                result.push_str(&format!("${}\r\n{}\r\n", response.result.len(), response.result));
+            }
+        } else {
+            result.push_str("$-1\r\n"); // NULL for failed commands
+        }
+    }
+    result
+}
+
+fn format_response(operation: &str, response: &RustResponse) -> String {
+    if operation == "ping" {
+        "+PONG\r\n".to_string()
+    } else if operation == "multi" || operation == "discard" || 
+              operation == "watch" || operation == "unwatch" {
+        if response.success {
+            format!("+{}\r\n", response.result)
+        } else {
+            "-ERR transaction command failed\r\n".to_string()
+        }
+    } else if response.result == "QUEUED" {
+        "+QUEUED\r\n".to_string()
+    } else if operation == "keys" && response.success {
+        // Array response for KEYS command
+        if response.result.is_empty() {
+            "*0\r\n".to_string()
+        } else {
+            let keys: Vec<&str> = response.result.split(',').collect();
+            let mut result = format!("*{}\r\n", keys.len());
+            for key in keys {
+                result.push_str(&format!("${}\r\n{}\r\n", key.len(), key));
+            }
+            result
+        }
+    } else if operation == "hgetall" && response.success {
+        // Array response for HGETALL command
+        if response.result.is_empty() {
+            "*0\r\n".to_string()
+        } else {
+            let pairs: Vec<&str> = response.result.split(',').collect();
+            let mut result = format!("*{}\r\n", pairs.len() * 2);
+            for pair in pairs {
+                if let Some(colon_pos) = pair.find(':') {
+                    let field = &pair[..colon_pos];
+                    let value = &pair[colon_pos + 1..];
+                    result.push_str(&format!("${}\r\n{}\r\n", field.len(), field));
+                    result.push_str(&format!("${}\r\n{}\r\n", value.len(), value));
+                }
+            }
+            result
+        }
+    } else if operation == "hmget" && response.success {
+        // Array response for HMGET command
+        if response.result.is_empty() {
+            "*0\r\n".to_string()
+        } else {
+            let values: Vec<&str> = response.result.split(',').collect();
+            let mut result = format!("*{}\r\n", values.len());
+            for value in values {
+                if value == "NULL" {
+                    result.push_str("$-1\r\n");
+                } else {
+                    result.push_str(&format!("${}\r\n{}\r\n", value.len(), value));
+                }
+            }
+            result
+        }
+    } else if operation == "smembers" || operation == "sinter" || operation == "sdiff" {
+        // Array response for set operations
+        if response.success {
+            if response.result.is_empty() {
+                "*0\r\n".to_string()
+            } else {
+                let members: Vec<&str> = response.result.split(',').collect();
+                let mut result = format!("*{}\r\n", members.len());
+                for member in members {
+                    result.push_str(&format!("${}\r\n{}\r\n", member.len(), member));
+                }
+                result
+            }
+        } else {
+            "*0\r\n".to_string()
+        }
+    } else if operation == "exists" || operation == "expire" || operation == "ttl" || 
+              operation == "llen" || operation == "lpush" || operation == "rpush" ||
+              operation == "incr" || operation == "decr" || operation == "incrby" || 
+              operation == "decrby" || operation == "del" || operation == "hset" ||
+              operation == "hdel" || operation == "hexists" || operation == "sadd" ||
+              operation == "sismember" || operation == "scard" {
+        // Integer response for commands that return numbers
+        if response.success {
+            format!(":{}\r\n", response.result)
+        } else {
+            "-ERR command failed\r\n".to_string()
+        }
+    } else if operation == "invalid" {
+        "-ERR invalid command format\r\n".to_string()
+    } else if response.success {
+        if response.result.is_empty() {
+            "$-1\r\n".to_string()
+        } else {
+            format!("${}\r\n{}\r\n", response.result.len(), response.result)
+        }
+    } else {
+        "-ERR not found\r\n".to_string()
+    }
 }
 
 fn parse_resp3_command(decoded: DecodedFrame<BytesFrame>) -> Option<(String, String, String)> {
@@ -620,6 +693,27 @@ fn parse_resp3_command(decoded: DecodedFrame<BytesFrame>) -> Option<(String, Str
             } else {
                 None
             }
+        }
+        // Basic transaction commands (sequential execution, not true atomicity)
+        "MULTI" => {
+            Some(("multi".to_string(), String::new(), String::new()))
+        }
+        "EXEC" => {
+            Some(("exec".to_string(), String::new(), String::new()))
+        }
+        "DISCARD" => {
+            Some(("discard".to_string(), String::new(), String::new()))
+        }
+        "WATCH" if parts.len() >= 2 => {
+            if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
+                let key_string = String::from_utf8_lossy(key).to_string();
+                Some(("watch".to_string(), key_string, String::new()))
+            } else {
+                None
+            }
+        }
+        "UNWATCH" => {
+            Some(("unwatch".to_string(), String::new(), String::new()))
         }
         _ => None,
     }
