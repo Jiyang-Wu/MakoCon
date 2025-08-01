@@ -1,8 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::net::TcpListener;
-use std::io::{Read, Write};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::oneshot;
 use redis_protocol::resp3::{types::BytesFrame, types::DecodedFrame};
 
 mod resp3_handler;
@@ -24,32 +25,46 @@ pub struct RustResponse {
     pub success: bool,
 }
 
-// Global state for the queues
+// Global state - hybrid approach for FFI compatibility
 static mut REQUEST_QUEUE: Option<Arc<Mutex<VecDeque<RustRequest>>>> = None;
-static mut RESPONSE_QUEUE: Option<Arc<Mutex<HashMap<u32, RustResponse>>>> = None;
+static mut RESPONSE_CHANNELS: Option<Arc<Mutex<HashMap<u32, oneshot::Sender<RustResponse>>>>> = None;
 static mut NEXT_ID: Option<Arc<AtomicU32>> = None;
-static mut LISTENER_HANDLE: Option<std::thread::JoinHandle<()>> = None;
+static mut RUNTIME_HANDLE: Option<tokio::runtime::Handle> = None;
 
-// Initialize Rust socket listener and queues
+// Initialize Rust async runtime and channels
 #[no_mangle]
 pub extern "C" fn rust_init() -> bool {
     unsafe {
+        // Create async runtime
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("Failed to create tokio runtime: {}", e);
+                return false;
+            }
+        };
+        
+        // Get runtime handle for spawning tasks
+        RUNTIME_HANDLE = Some(rt.handle().clone());
+        
+        // Create hybrid state - queue for FFI + channels for async
         REQUEST_QUEUE = Some(Arc::new(Mutex::new(VecDeque::new())));
-        RESPONSE_QUEUE = Some(Arc::new(Mutex::new(HashMap::new())));
+        RESPONSE_CHANNELS = Some(Arc::new(Mutex::new(HashMap::new())));
         NEXT_ID = Some(Arc::new(AtomicU32::new(1)));
         
         let request_queue = REQUEST_QUEUE.as_ref().unwrap().clone();
-        let response_queue = RESPONSE_QUEUE.as_ref().unwrap().clone();
+        let response_channels = RESPONSE_CHANNELS.as_ref().unwrap().clone();
         let next_id = NEXT_ID.as_ref().unwrap().clone();
         
-        // Start socket listener thread
-        let handle = std::thread::spawn(move || {
-            if let Err(e) = start_socket_listener(request_queue, response_queue, next_id) {
-                eprintln!("Socket listener error: {}", e);
-            }
+        // Spawn async server in background thread with runtime
+        std::thread::spawn(move || {
+            rt.block_on(async {
+                if let Err(e) = start_async_server(request_queue, response_channels, next_id).await {
+                    eprintln!("Async server error: {}", e);
+                }
+            });
         });
         
-        LISTENER_HANDLE = Some(handle);
         true
     }
 }
@@ -79,11 +94,11 @@ pub extern "C" fn rust_retrieve_request_from_queue(id: *mut u32, operation: *mut
     }
 }
 
-// Put response back to queue (called by C++)
+// Put response back via oneshot channel (called by C++)
 #[no_mangle]
 pub extern "C" fn rust_put_response_back_queue(id: u32, result: *const std::os::raw::c_char, success: bool) -> bool {
     unsafe {
-        if let Some(queue_ref) = &RESPONSE_QUEUE {
+        if let Some(channels_ref) = &RESPONSE_CHANNELS {
             let result_str = std::ffi::CStr::from_ptr(result).to_string_lossy().to_string();
             let response = RustResponse {
                 id,
@@ -91,9 +106,19 @@ pub extern "C" fn rust_put_response_back_queue(id: u32, result: *const std::os::
                 success,
             };
             
-            let mut queue = queue_ref.lock().unwrap();
-            queue.insert(id, response);
-            true
+            let mut channels = channels_ref.lock().unwrap();
+            if let Some(sender) = channels.remove(&id) {
+                match sender.send(response) {
+                    Ok(_) => true,
+                    Err(_) => {
+                        eprintln!("Failed to send response for request {}", id);
+                        false
+                    }
+                }
+            } else {
+                eprintln!("No response channel found for request {}", id);
+                false
+            }
         } else {
             false
         }
@@ -110,34 +135,38 @@ pub extern "C" fn rust_free_string(ptr: *mut std::os::raw::c_char) {
     }
 }
 
-fn start_socket_listener(
+// External C function to notify C++ of new requests
+extern "C" {
+    fn cpp_notify_request_available();
+}
+
+async fn start_async_server(
     request_queue: Arc<Mutex<VecDeque<RustRequest>>>,
-    response_queue: Arc<Mutex<HashMap<u32, RustResponse>>>,
+    response_channels: Arc<Mutex<HashMap<u32, oneshot::Sender<RustResponse>>>>,
     next_id: Arc<AtomicU32>,
 ) -> std::io::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:6380")?;
-    println!("Rust socket listener started on 127.0.0.1:6380");
+    let listener = TcpListener::bind("127.0.0.1:6380").await?;
+    println!("Async Rust server started on 127.0.0.1:6380");
     
-    for stream in listener.incoming() {
-        let stream = stream?;
+    loop {
+        let (stream, _) = listener.accept().await?;
         let request_queue = request_queue.clone();
-        let response_queue = response_queue.clone();
+        let response_channels = response_channels.clone();
         let next_id = next_id.clone();
         
-        std::thread::spawn(move || {
-            if let Err(e) = handle_client(stream, request_queue, response_queue, next_id) {
+        // Spawn async task for each client (lightweight)
+        tokio::spawn(async move {
+            if let Err(e) = handle_client_async(stream, request_queue, response_channels, next_id).await {
                 eprintln!("Client handling error: {}", e);
             }
         });
     }
-    
-    Ok(())
 }
 
-fn handle_client(
-    mut stream: std::net::TcpStream,
+async fn handle_client_async(
+    mut stream: TcpStream,
     request_queue: Arc<Mutex<VecDeque<RustRequest>>>,
-    response_queue: Arc<Mutex<HashMap<u32, RustResponse>>>,
+    response_channels: Arc<Mutex<HashMap<u32, oneshot::Sender<RustResponse>>>>,
     next_id: Arc<AtomicU32>,
 ) -> std::io::Result<()> {
     let mut resp3 = Resp3Handler::new(4096);
@@ -146,7 +175,7 @@ fn handle_client(
     let mut in_transaction = false;
     
     loop {
-        match stream.read(&mut read_buf) {
+        match stream.read(&mut read_buf).await {
             Ok(0) => break, // Connection closed
             Ok(n) => resp3.read_bytes(&read_buf[..n]),
             Err(e) => return Err(e),
@@ -171,56 +200,80 @@ fn handle_client(
                     if operation == "multi" {
                         in_transaction = true;
                         pipeline_buffer.clear();
-                        stream.write_all(b"+OK\r\n")?;
+                        stream.write_all(b"+OK\r\n").await?;
                         continue;
                     } else if operation == "exec" {
                         in_transaction = false;
                         // Process all commands in pipeline_buffer and return array
                         let mut exec_responses = Vec::new();
                         for buffered_request in &pipeline_buffer {
-                            let mut queue = request_queue.lock().unwrap();
-                            queue.push_back(buffered_request.clone());
-                            drop(queue);
+                            // Add to request queue
+                            {
+                                let mut queue = request_queue.lock().unwrap();
+                                queue.push_back(buffered_request.clone());
+                            }
+                            // Notify C++ of new request
+                            unsafe { cpp_notify_request_available(); }
                             
-                            let response = wait_for_response(&response_queue, buffered_request.id);
+                            // Create oneshot channel and wait for response
+                            let (response_tx, response_rx) = oneshot::channel();
+                            {
+                                let mut channels = response_channels.lock().unwrap();
+                                channels.insert(buffered_request.id, response_tx);
+                            }
+                            
+                            let response = response_rx.await.map_err(|_| {
+                                std::io::Error::new(std::io::ErrorKind::Other, "Response channel closed")
+                            })?;
                             exec_responses.push(response);
                         }
                         pipeline_buffer.clear();
                         
                         // Send array response for EXEC
                         let exec_response_str = format_exec_response(exec_responses);
-                        stream.write_all(exec_response_str.as_bytes())?;
+                        stream.write_all(exec_response_str.as_bytes()).await?;
                         continue;
                     } else if operation == "discard" {
                         in_transaction = false;
                         pipeline_buffer.clear();
-                        stream.write_all(b"+OK\r\n")?;
+                        stream.write_all(b"+OK\r\n").await?;
                         continue;
                     } else if operation == "watch" {
-                        stream.write_all(b"+OK\r\n")?;
+                        stream.write_all(b"+OK\r\n").await?;
                         continue;
                     } else if operation == "unwatch" {
-                        stream.write_all(b"+OK\r\n")?;
+                        stream.write_all(b"+OK\r\n").await?;
                         continue;
                     }
                     
                     // If in transaction, buffer the command and send QUEUED
                     if in_transaction {
                         pipeline_buffer.push(request);
-                        stream.write_all(b"+QUEUED\r\n")?;
+                        stream.write_all(b"+QUEUED\r\n").await?;
                     } else {
                         // Process command immediately
                         {
                             let mut queue = request_queue.lock().unwrap();
                             queue.push_back(request);
                         }
+                        // Notify C++ of new request
+                        unsafe { cpp_notify_request_available(); }
                         
-                        let response = wait_for_response(&response_queue, req_id);
+                        // Create oneshot channel and wait for response
+                        let (response_tx, response_rx) = oneshot::channel();
+                        {
+                            let mut channels = response_channels.lock().unwrap();
+                            channels.insert(req_id, response_tx);
+                        }
+                        
+                        let response = response_rx.await.map_err(|_| {
+                            std::io::Error::new(std::io::ErrorKind::Other, "Response channel closed")
+                        })?;
                         let response_str = format_response(&operation, &response);
-                        stream.write_all(response_str.as_bytes())?;
+                        stream.write_all(response_str.as_bytes()).await?;
                     }
                 } else {
-                    stream.write_all(b"-ERR invalid command format\r\n")?;
+                    stream.write_all(b"-ERR invalid command format\r\n").await?;
                 }
             } else {
                 break;
@@ -230,6 +283,8 @@ fn handle_client(
     
     Ok(())
 }
+
+// Old handle_client function removed - using async version
 
 fn format_exec_response(responses: Vec<RustResponse>) -> String {
     let mut result = format!("*{}\r\n", responses.len());
@@ -719,14 +774,4 @@ fn parse_resp3_command(decoded: DecodedFrame<BytesFrame>) -> Option<(String, Str
     }
 }
 
-fn wait_for_response(response_queue: &Arc<Mutex<HashMap<u32, RustResponse>>>, request_id: u32) -> RustResponse {
-    loop {
-        {
-            let mut queue = response_queue.lock().unwrap();
-            if let Some(response) = queue.remove(&request_id) {
-                return response;
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-}
+// Old wait_for_response function removed - using oneshot channels

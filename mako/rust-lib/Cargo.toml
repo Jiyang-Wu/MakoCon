@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 redis-protocol = { version = "6.0.0", features = ["resp3", "bytes", "codec"] }
 bytes = "1.4"
+tokio = { version = "1.0", features = ["full"] }
 
 [lib]
 crate-type = ["staticlib"]

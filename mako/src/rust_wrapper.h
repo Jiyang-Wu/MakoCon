@@ -6,6 +6,8 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
 #include "kv_store.h"
 
 using namespace std;
@@ -26,6 +28,7 @@ public:
     bool init();
     void start_polling();
     void stop();
+    void notify_request_available();
     
 private:
     void poll_requests();
@@ -38,8 +41,18 @@ private:
     std::atomic<bool> running_;
     std::atomic<bool> initialized_;
     
-    // Polling thread
-    std::thread polling_thread_;
+    // Event-driven synchronization
+    std::mutex request_mutex_;
+    std::condition_variable request_cv_;
+    
+    // Processing thread
+    std::thread processing_thread_;
 };
+
+// Global pointer for Rust to notify C++
+extern RustWrapper* g_rust_wrapper_instance;
+
+// C function for Rust to call when new request is available
+extern "C" void cpp_notify_request_available();
 
 #endif

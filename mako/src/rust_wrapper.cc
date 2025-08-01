@@ -1,6 +1,17 @@
 #include "rust_wrapper.h"
 
+// Global instance pointer for Rust notification
+RustWrapper* g_rust_wrapper_instance = nullptr;
+
+// C function implementation for Rust to call
+extern "C" void cpp_notify_request_available() {
+    if (g_rust_wrapper_instance) {
+        g_rust_wrapper_instance->notify_request_available();
+    }
+}
+
 RustWrapper::RustWrapper() : running_(false), initialized_(false) {
+    g_rust_wrapper_instance = this;
 }
 
 RustWrapper::~RustWrapper() {
@@ -26,36 +37,50 @@ bool RustWrapper::init() {
 }
 
 void RustWrapper::start_polling() {
-    if (!initialized_ || polling_thread_.joinable()) {
+    if (!initialized_ || processing_thread_.joinable()) {
         return;
     }
     
-    polling_thread_ = std::thread(&RustWrapper::poll_requests, this);
-    std::cout << "Started polling thread for request processing" << std::endl;
+    processing_thread_ = std::thread(&RustWrapper::poll_requests, this);
+    std::cout << "Started event-driven request processing thread" << std::endl;
 }
 
 void RustWrapper::stop() {
     if (running_) {
         running_ = false;
-        if (polling_thread_.joinable()) {
-            polling_thread_.join();
+        // Notify the processing thread to wake up and exit
+        request_cv_.notify_all();
+        if (processing_thread_.joinable()) {
+            processing_thread_.join();
         }
     }
+    g_rust_wrapper_instance = nullptr;
+}
+
+void RustWrapper::notify_request_available() {
+    request_cv_.notify_one();
 }
 
 void RustWrapper::poll_requests() {
     long int counter = 0;
     
     while (running_) {
-        counter++;
+        // Wait for notification from Rust
+        std::unique_lock<std::mutex> lock(request_mutex_);
+        request_cv_.wait(lock);
         
+        if (!running_) {
+            break;
+        }
+        
+        // Process all available requests
         uint32_t id;
         char* operation = nullptr;
         char* key = nullptr;
         char* value = nullptr;
         
-        // Poll Rust for requests
-        if (rust_retrieve_request_from_queue(&id, &operation, &key, &value)) {
+        while (rust_retrieve_request_from_queue(&id, &operation, &key, &value)) {
+            counter++;
             std::cout << "Processing request " << id << ": " << operation << ":" << key << ":" << value << std::endl;
             
             // Execute the request
@@ -70,11 +95,8 @@ void RustWrapper::poll_requests() {
             if (value) rust_free_string(value);
         }
         
-        // Sleep for a short time to avoid busy polling
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        
         if (counter % 100 == 0) {
-            std::cout << "Polling loop: " << counter << " iterations" << std::endl;
+            std::cout << "Processed " << counter << " requests so far" << std::endl;
         }
     }
 }
