@@ -7,6 +7,9 @@ MakoCon is a Redis-compatible key-value store implementation written in C++ with
 The system uses a hybrid Rust-C++ architecture:
 
 - **Rust Layer** (`rust-lib/`): Handles TCP networking, RESP3 protocol parsing, and client connections
+  * When initialized, spawns a background thread hosting a tokio runtime
+  * Per client connection, creates a tokio task inside the tokio runtime
+  * tokio task stays lightweight and only comsumes CPU when active
 - **C++ Layer** (`src/`): Implements the core key-value storage engine and data structures
 - **Communication**: Rust and C++ communicate via a request-response queue system
 
