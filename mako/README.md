@@ -111,6 +111,10 @@ The system uses a hybrid Rust-C++ architecture:
 - Supports both explicit MULTI/EXEC transactions and implicit pipelining
 
 
+## TODOs:
+❌ pipe/exec() returns results for each operation. For Mako's transaction model, how to be compatible with it, https://redis.io/docs/latest/develop/using-commands/transactions/.
+❌ can't support regex expression, see `cleanup_redis`
+
 ## ❌ Unsupported Features
 
 ### True Atomic Transactions
