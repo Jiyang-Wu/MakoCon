@@ -15,7 +15,7 @@ using namespace std;
 // C interface for Rust functions
 extern "C" {
     bool rust_init();
-    bool rust_retrieve_request_from_queue(uint32_t* id, char** operation, char** key, char** value);
+    bool rust_retrieve_request_from_queue(uint32_t* id, char** request_data);
     bool rust_put_response_back_queue(uint32_t id, const char* result, bool success);
     void rust_free_string(char* ptr);
 }
@@ -33,6 +33,7 @@ public:
 private:
     void poll_requests();
     void execute_request(uint32_t id, const string& operation, const string& key, const string& value);
+    void execute_batch_request(uint32_t id, const string& request_data);
     
     // Core storage
     KVStore kv_store_;

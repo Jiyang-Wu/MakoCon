@@ -11,11 +11,16 @@ use resp3_handler::Resp3Handler;
 
 // Request and Response structures to match C++ expectations
 #[derive(Debug, Clone)]
-pub struct RustRequest {
-    pub id: u32,
+pub struct RustOperation {
     pub operation: String,
     pub key: String,
     pub value: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RustRequest {
+    pub id: u32,
+    pub operations: Vec<RustOperation>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,23 +74,31 @@ pub extern "C" fn rust_init() -> bool {
     }
 }
 
-// Retrieve request from queue (called by C++)
+// Retrieve request from queue (called by C++) - pass entire RustRequest as JSON
 #[no_mangle]
-pub extern "C" fn rust_retrieve_request_from_queue(id: *mut u32, operation: *mut *mut std::os::raw::c_char, key: *mut *mut std::os::raw::c_char, value: *mut *mut std::os::raw::c_char) -> bool {
+pub extern "C" fn rust_retrieve_request_from_queue(
+    id: *mut u32, 
+    request_json: *mut *mut std::os::raw::c_char
+) -> bool {
     unsafe {
         if let Some(queue_ref) = &REQUEST_QUEUE {
             let mut queue = queue_ref.lock().unwrap();
             if let Some(request) = queue.pop_front() {
                 *id = request.id;
                 
-                // Allocate C strings
-                let op_cstring = std::ffi::CString::new(request.operation).unwrap();
-                let key_cstring = std::ffi::CString::new(request.key).unwrap();
-                let val_cstring = std::ffi::CString::new(request.value).unwrap();
+                // Serialize the operations in Redis-style format: "op1\r\nkey1\r\nval1\r\nop2\r\nkey2\r\nval2\r\n..."
+                let mut request_str = String::new();
+                for op in request.operations.iter() {
+                    request_str.push_str(&op.operation);
+                    request_str.push_str("\r\n");
+                    request_str.push_str(&op.key);
+                    request_str.push_str("\r\n");
+                    request_str.push_str(&op.value);
+                    request_str.push_str("\r\n");
+                }
                 
-                *operation = op_cstring.into_raw();
-                *key = key_cstring.into_raw();
-                *value = val_cstring.into_raw();
+                let request_cstring = std::ffi::CString::new(request_str).unwrap();
+                *request_json = request_cstring.into_raw();
                 
                 return true;
             }
@@ -169,7 +182,7 @@ async fn handle_client_async(
     response_channels: Arc<Mutex<HashMap<u32, oneshot::Sender<RustResponse>>>>,
     next_id: Arc<AtomicU32>,
 ) -> std::io::Result<()> {
-    let mut resp3 = Resp3Handler::new(4096);
+    let mut resp3 = Resp3Handler::new(10* 1024*1024); // 10MB internal buffer
     let mut read_buf = [0u8; 4096];
     let mut pipeline_buffer: Vec<RustRequest> = Vec::new();
     let mut in_transaction = false;
@@ -189,9 +202,11 @@ async fn handle_client_async(
                     
                     let request = RustRequest {
                         id: req_id,
-                        operation: parsed_request.0.clone(),
-                        key: parsed_request.1,
-                        value: parsed_request.2,
+                        operations: vec![RustOperation {
+                            operation: parsed_request.0.clone(),
+                            key: parsed_request.1,
+                            value: parsed_request.2,
+                        }],
                     };
                     
                     let operation = parsed_request.0.clone();
@@ -204,13 +219,24 @@ async fn handle_client_async(
                         continue;
                     } else if operation == "exec" {
                         in_transaction = false;
-                        // Process all commands in pipeline_buffer and return array
-                        let mut exec_responses = Vec::new();
-                        for buffered_request in &pipeline_buffer {
-                            // Add to request queue
+                        // Process all commands as a single batch request
+                        if !pipeline_buffer.is_empty() {
+                            let batch_id = next_id.fetch_add(1, Ordering::SeqCst);
+                            let mut batch_operations = Vec::new();
+                            
+                            for buffered_request in &pipeline_buffer {
+                                batch_operations.extend(buffered_request.operations.clone());
+                            }
+                            
+                            let batch_request = RustRequest {
+                                id: batch_id,
+                                operations: batch_operations,
+                            };
+                            
+                            // Add batch request to queue
                             {
                                 let mut queue = request_queue.lock().unwrap();
-                                queue.push_back(buffered_request.clone());
+                                queue.push_back(batch_request);
                             }
                             // Notify C++ of new request
                             unsafe { cpp_notify_request_available(); }
@@ -219,19 +245,21 @@ async fn handle_client_async(
                             let (response_tx, response_rx) = oneshot::channel();
                             {
                                 let mut channels = response_channels.lock().unwrap();
-                                channels.insert(buffered_request.id, response_tx);
+                                channels.insert(batch_id, response_tx);
                             }
                             
                             let response = response_rx.await.map_err(|_| {
                                 std::io::Error::new(std::io::ErrorKind::Other, "Response channel closed")
                             })?;
-                            exec_responses.push(response);
+                            
+                            // Response contains results for all operations separated by '|'
+                            // Send array response for EXEC
+                            let exec_response_str = format_exec_response_from_batch(&response.result);
+                            stream.write_all(exec_response_str.as_bytes()).await?;
+                        } else {
+                            stream.write_all(b"*0\r\n").await?; // Empty array for empty transaction
                         }
                         pipeline_buffer.clear();
-                        
-                        // Send array response for EXEC
-                        let exec_response_str = format_exec_response(exec_responses);
-                        stream.write_all(exec_response_str.as_bytes()).await?;
                         continue;
                     } else if operation == "discard" {
                         in_transaction = false;
@@ -284,19 +312,20 @@ async fn handle_client_async(
     Ok(())
 }
 
-// Old handle_client function removed - using async version
-
-fn format_exec_response(responses: Vec<RustResponse>) -> String {
-    let mut result = format!("*{}\r\n", responses.len());
-    for response in responses {
-        if response.success {
-            if response.result.is_empty() {
-                result.push_str("$-1\r\n"); // NULL
-            } else {
-                result.push_str(&format!("${}\r\n{}\r\n", response.result.len(), response.result));
-            }
+fn format_exec_response_from_batch(batch_result: &str) -> String {
+    // C++ returns results separated by '\r\n': "result1\r\nresult2\r\nresult3\r\n..."
+    if batch_result.is_empty() {
+        return "*0\r\n".to_string();
+    }
+    
+    let parts: Vec<&str> = batch_result.split("\r\n").collect();
+    let mut result = format!("*{}\r\n", parts.len());
+    
+    for part in parts {
+        if part.is_empty() {
+            result.push_str("$-1\r\n"); // NULL
         } else {
-            result.push_str("$-1\r\n"); // NULL for failed commands
+            result.push_str(&format!("${}\r\n{}\r\n", part.len(), part));
         }
     }
     result
