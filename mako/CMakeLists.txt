@@ -20,7 +20,7 @@ find_package(Threads REQUIRED)
 
 # Rust library path
 set(RUST_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/rust-lib/target/release")
-set(RUST_LIB_NAME "mako")
+set(RUST_LIB_NAME "rust_redis")
 
 # Custom target to build Rust library
 add_custom_target(rust_build ALL
