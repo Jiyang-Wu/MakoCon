@@ -7,7 +7,6 @@ RustWrapper* g_kv_store = nullptr;
 void signal_handler(int signal) {
     if (g_kv_store) {
         std::cout << "\nShutting down RustWrapper..." << std::endl;
-        g_kv_store->stop();
         delete g_kv_store;
         g_kv_store = nullptr;
     }
@@ -31,10 +30,6 @@ int main() {
     }
     
     std::cout << "KV Store initialized. Starting request polling..." << std::endl;
-    
-    // Start the polling thread
-    g_kv_store->start_polling();
-    
     std::cout << "Mako KV Store is running. Press Ctrl+C to stop." << std::endl;
     
     // Keep main thread alive

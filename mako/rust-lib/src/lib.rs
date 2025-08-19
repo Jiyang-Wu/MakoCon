@@ -11,30 +11,21 @@ use resp3_handler::Resp3Handler;
 
 // Request and Response structures to match C++ expectations
 #[derive(Debug, Clone)]
-pub struct RustOperation {
-    pub operation: String,
-    pub key: String,
-    pub value: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct RustRequest {
-    pub id: u32,
-    pub operations: Vec<RustOperation>,
-}
-
-#[derive(Debug, Clone)]
 pub struct RustResponse {
-    pub id: u32,
     pub result: String,
     pub success: bool,
 }
 
 // Global state - hybrid approach for FFI compatibility
-static mut REQUEST_QUEUE: Option<Arc<Mutex<VecDeque<RustRequest>>>> = None;
-static mut RESPONSE_CHANNELS: Option<Arc<Mutex<HashMap<u32, oneshot::Sender<RustResponse>>>>> = None;
-static mut NEXT_ID: Option<Arc<AtomicU32>> = None;
 static mut RUNTIME_HANDLE: Option<tokio::runtime::Handle> = None;
+static DATABASE_MUTEX: Mutex<()> = Mutex::new(());
+
+
+extern "C" {
+    fn cpp_execute_request_sync(operation: *const std::os::raw::c_char, key: *const std::os::raw::c_char, value: *const std::os::raw::c_char, result: *mut *mut std::os::raw::c_char) -> bool;
+    fn cpp_free_string(ptr: *mut std::os::raw::c_char);
+}
+
 
 // Initialize Rust async runtime and channels
 #[no_mangle]
@@ -52,19 +43,10 @@ pub extern "C" fn rust_init() -> bool {
         // Get runtime handle for spawning tasks
         RUNTIME_HANDLE = Some(rt.handle().clone());
         
-        // Create hybrid state - queue for FFI + channels for async
-        REQUEST_QUEUE = Some(Arc::new(Mutex::new(VecDeque::new())));
-        RESPONSE_CHANNELS = Some(Arc::new(Mutex::new(HashMap::new())));
-        NEXT_ID = Some(Arc::new(AtomicU32::new(1)));
-        
-        let request_queue = REQUEST_QUEUE.as_ref().unwrap().clone();
-        let response_channels = RESPONSE_CHANNELS.as_ref().unwrap().clone();
-        let next_id = NEXT_ID.as_ref().unwrap().clone();
-        
         // Spawn async server in background thread with runtime
         std::thread::spawn(move || {
             rt.block_on(async {
-                if let Err(e) = start_async_server(request_queue, response_channels, next_id).await {
+                if let Err(e) = start_async_server().await {
                     eprintln!("Async server error: {}", e);
                 }
             });
@@ -74,69 +56,22 @@ pub extern "C" fn rust_init() -> bool {
     }
 }
 
-// Retrieve request from queue (called by C++) - pass entire RustRequest as JSON
-#[no_mangle]
-pub extern "C" fn rust_retrieve_request_from_queue(
-    id: *mut u32, 
-    request_json: *mut *mut std::os::raw::c_char
-) -> bool {
-    unsafe {
-        if let Some(queue_ref) = &REQUEST_QUEUE {
-            let mut queue = queue_ref.lock().unwrap();
-            if let Some(request) = queue.pop_front() {
-                *id = request.id;
-                
-                // Serialize the operations in Redis-style format: "op1\r\nkey1\r\nval1\r\nop2\r\nkey2\r\nval2\r\n..."
-                let mut request_str = String::new();
-                for op in request.operations.iter() {
-                    request_str.push_str(&op.operation);
-                    request_str.push_str("\r\n");
-                    request_str.push_str(&op.key);
-                    request_str.push_str("\r\n");
-                    request_str.push_str(&op.value);
-                    request_str.push_str("\r\n");
-                }
-                
-                let request_cstring = std::ffi::CString::new(request_str).unwrap();
-                *request_json = request_cstring.into_raw();
-                
-                return true;
+async fn start_async_server() -> std::io::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:6380").await?;
+    println!("Async Rust server started on 127.0.0.1:6380");
+    
+    loop {
+        let (stream, _) = listener.accept().await?;
+        
+        // Spawn async task for each client
+        tokio::spawn(async move {
+            if let Err(e) = handle_client_async(stream).await {
+                eprintln!("Client handling error: {}", e);
             }
-        }
-        false
+        });
     }
 }
 
-// Put response back via oneshot channel (called by C++)
-#[no_mangle]
-pub extern "C" fn rust_put_response_back_queue(id: u32, result: *const std::os::raw::c_char, success: bool) -> bool {
-    unsafe {
-        if let Some(channels_ref) = &RESPONSE_CHANNELS {
-            let result_str = std::ffi::CStr::from_ptr(result).to_string_lossy().to_string();
-            let response = RustResponse {
-                id,
-                result: result_str,
-                success,
-            };
-            
-            let mut channels = channels_ref.lock().unwrap();
-            if let Some(sender) = channels.remove(&id) {
-                match sender.send(response) {
-                    Ok(_) => true,
-                    Err(_) => {
-                        eprintln!("Failed to send response for request {}", id);
-                        false
-                    }
-                }
-            } else {
-                eprintln!("No response channel found for request {}", id);
-                false
-            }
-        } else {
-            false
-        }
-    }
-}
 
 // Free C strings allocated in retrieve_request_from_queue
 #[no_mangle]
@@ -153,39 +88,9 @@ extern "C" {
     fn cpp_notify_request_available();
 }
 
-async fn start_async_server(
-    request_queue: Arc<Mutex<VecDeque<RustRequest>>>,
-    response_channels: Arc<Mutex<HashMap<u32, oneshot::Sender<RustResponse>>>>,
-    next_id: Arc<AtomicU32>,
-) -> std::io::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:6380").await?;
-    println!("Async Rust server started on 127.0.0.1:6380");
-    
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let request_queue = request_queue.clone();
-        let response_channels = response_channels.clone();
-        let next_id = next_id.clone();
-        
-        // Spawn async task for each client (lightweight)
-        tokio::spawn(async move {
-            if let Err(e) = handle_client_async(stream, request_queue, response_channels, next_id).await {
-                eprintln!("Client handling error: {}", e);
-            }
-        });
-    }
-}
-
-async fn handle_client_async(
-    mut stream: TcpStream,
-    request_queue: Arc<Mutex<VecDeque<RustRequest>>>,
-    response_channels: Arc<Mutex<HashMap<u32, oneshot::Sender<RustResponse>>>>,
-    next_id: Arc<AtomicU32>,
-) -> std::io::Result<()> {
-    let mut resp3 = Resp3Handler::new(10* 1024*1024); // 10MB internal buffer
+async fn handle_client_async(mut stream: TcpStream) -> std::io::Result<()> {
+    let mut resp3 = Resp3Handler::new(10 * 1024 * 1024); // 10MB internal buffer
     let mut read_buf = [0u8; 4096];
-    let mut pipeline_buffer: Vec<RustRequest> = Vec::new();
-    let mut in_transaction = false;
     
     loop {
         match stream.read(&mut read_buf).await {
@@ -194,112 +99,23 @@ async fn handle_client_async(
             Err(e) => return Err(e),
         }
         
-        // Process frames one by one but handle batching intelligently
+        // Process frames one by one
         while let Ok(opt) = resp3.next_frame() {
             if let Some(frame) = opt {
-                if let Some(parsed_request) = parse_resp3_command(frame) {
-                    let req_id = next_id.fetch_add(1, Ordering::SeqCst);
+                if let Some((operation, key, value)) = parse_resp3_command(frame) {
+                    // Use spawn_blocking for C++ calls to avoid blocking the async runtime
+                    let op_clone = operation.clone();
+                    let key_clone = key.clone();
+                    let value_clone = value.clone();
                     
-                    let request = RustRequest {
-                        id: req_id,
-                        operations: vec![RustOperation {
-                            operation: parsed_request.0.clone(),
-                            key: parsed_request.1,
-                            value: parsed_request.2,
-                        }],
-                    };
+                    let response = tokio::task::spawn_blocking(move || {
+                        call_cpp_operation(&op_clone, &key_clone, &value_clone)
+                    }).await.map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::Other, format!("Blocking task failed: {}", e))
+                    })?;
                     
-                    let operation = parsed_request.0.clone();
-                    
-                    // Handle transaction commands
-                    if operation == "multi" {
-                        in_transaction = true;
-                        pipeline_buffer.clear();
-                        stream.write_all(b"+OK\r\n").await?;
-                        continue;
-                    } else if operation == "exec" {
-                        in_transaction = false;
-                        // Process all commands as a single batch request
-                        if !pipeline_buffer.is_empty() {
-                            let batch_id = next_id.fetch_add(1, Ordering::SeqCst);
-                            let mut batch_operations = Vec::new();
-                            
-                            for buffered_request in &pipeline_buffer {
-                                batch_operations.extend(buffered_request.operations.clone());
-                            }
-                            
-                            let batch_request = RustRequest {
-                                id: batch_id,
-                                operations: batch_operations,
-                            };
-                            
-                            // Add batch request to queue
-                            {
-                                let mut queue = request_queue.lock().unwrap();
-                                queue.push_back(batch_request);
-                            }
-                            // Notify C++ of new request
-                            unsafe { cpp_notify_request_available(); }
-                            
-                            // Create oneshot channel and wait for response
-                            let (response_tx, response_rx) = oneshot::channel();
-                            {
-                                let mut channels = response_channels.lock().unwrap();
-                                channels.insert(batch_id, response_tx);
-                            }
-                            
-                            let response = response_rx.await.map_err(|_| {
-                                std::io::Error::new(std::io::ErrorKind::Other, "Response channel closed")
-                            })?;
-                            
-                            // Response contains results for all operations separated by '|'
-                            // Send array response for EXEC
-                            let exec_response_str = format_exec_response_from_batch(&response.result);
-                            stream.write_all(exec_response_str.as_bytes()).await?;
-                        } else {
-                            stream.write_all(b"*0\r\n").await?; // Empty array for empty transaction
-                        }
-                        pipeline_buffer.clear();
-                        continue;
-                    } else if operation == "discard" {
-                        in_transaction = false;
-                        pipeline_buffer.clear();
-                        stream.write_all(b"+OK\r\n").await?;
-                        continue;
-                    } else if operation == "watch" {
-                        stream.write_all(b"+OK\r\n").await?;
-                        continue;
-                    } else if operation == "unwatch" {
-                        stream.write_all(b"+OK\r\n").await?;
-                        continue;
-                    }
-                    
-                    // If in transaction, buffer the command and send QUEUED
-                    if in_transaction {
-                        pipeline_buffer.push(request);
-                        stream.write_all(b"+QUEUED\r\n").await?;
-                    } else {
-                        // Process command immediately
-                        {
-                            let mut queue = request_queue.lock().unwrap();
-                            queue.push_back(request);
-                        }
-                        // Notify C++ of new request
-                        unsafe { cpp_notify_request_available(); }
-                        
-                        // Create oneshot channel and wait for response
-                        let (response_tx, response_rx) = oneshot::channel();
-                        {
-                            let mut channels = response_channels.lock().unwrap();
-                            channels.insert(req_id, response_tx);
-                        }
-                        
-                        let response = response_rx.await.map_err(|_| {
-                            std::io::Error::new(std::io::ErrorKind::Other, "Response channel closed")
-                        })?;
-                        let response_str = format_response(&operation, &response);
-                        stream.write_all(response_str.as_bytes()).await?;
-                    }
+                    let response_str = format_response(&operation, &response);
+                    stream.write_all(response_str.as_bytes()).await?;
                 } else {
                     stream.write_all(b"-ERR invalid command format\r\n").await?;
                 }
@@ -310,6 +126,37 @@ async fn handle_client_async(
     }
     
     Ok(())
+}
+
+// Direct C++ operation call using spawn_blocking and unified execute function
+fn call_cpp_operation(operation: &str, key: &str, value: &str) -> RustResponse {
+    // Use mutex to ensure thread-safe access to C++ database
+    // Note: This runs on a blocking thread pool, not the main async runtime
+    let _lock = DATABASE_MUTEX.lock().unwrap();
+    
+    unsafe {
+        let op_cstr = std::ffi::CString::new(operation).unwrap();
+        let key_cstr = std::ffi::CString::new(key).unwrap();
+        let value_cstr = std::ffi::CString::new(value).unwrap();
+        let mut result_ptr: *mut std::os::raw::c_char = std::ptr::null_mut();
+        
+        let success = cpp_execute_request_sync(
+            op_cstr.as_ptr(), 
+            key_cstr.as_ptr(), 
+            value_cstr.as_ptr(), 
+            &mut result_ptr
+        );
+        
+        let result = if success && !result_ptr.is_null() {
+            let result_str = std::ffi::CStr::from_ptr(result_ptr).to_string_lossy().to_string();
+            cpp_free_string(result_ptr);
+            result_str
+        } else {
+            String::new()
+        };
+        
+        RustResponse { result, success }
+    }
 }
 
 fn format_exec_response_from_batch(batch_result: &str) -> String {
