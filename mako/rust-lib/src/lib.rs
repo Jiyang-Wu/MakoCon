@@ -1,13 +1,12 @@
-use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::oneshot;
 use redis_protocol::resp3::{types::BytesFrame, types::DecodedFrame};
 
 mod resp3_handler;
 use resp3_handler::Resp3Handler;
+
+const MAX_BLOCKING_THREADS: usize = 4;
 
 // Request and Response structures to match C++ expectations
 #[derive(Debug, Clone)]
@@ -24,6 +23,7 @@ static DATABASE_MUTEX: Mutex<()> = Mutex::new(());
 extern "C" {
     fn cpp_execute_request_sync(operation: *const std::os::raw::c_char, key: *const std::os::raw::c_char, value: *const std::os::raw::c_char, result: *mut *mut std::os::raw::c_char) -> bool;
     fn cpp_free_string(ptr: *mut std::os::raw::c_char);
+    fn cpp_execute_batch_request_sync(batch_data: *const std::os::raw::c_char, result: *mut *mut std::os::raw::c_char) -> bool;
 }
 
 
@@ -32,7 +32,13 @@ extern "C" {
 pub extern "C" fn rust_init() -> bool {
     unsafe {
         // Create async runtime
-        let rt = match tokio::runtime::Runtime::new() {
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(MAX_BLOCKING_THREADS)
+            .thread_name("mako-worker")
+            .enable_all()
+            .build()
+        {
             Ok(rt) => rt,
             Err(e) => {
                 eprintln!("Failed to create tokio runtime: {}", e);
@@ -42,7 +48,7 @@ pub extern "C" fn rust_init() -> bool {
         
         // Get runtime handle for spawning tasks
         RUNTIME_HANDLE = Some(rt.handle().clone());
-        
+
         // Spawn async server in background thread with runtime
         std::thread::spawn(move || {
             rt.block_on(async {
@@ -91,6 +97,8 @@ extern "C" {
 async fn handle_client_async(mut stream: TcpStream) -> std::io::Result<()> {
     let mut resp3 = Resp3Handler::new(10 * 1024 * 1024); // 10MB internal buffer
     let mut read_buf = [0u8; 4096];
+    let mut pipeline_buffer: Vec<(String, String, String)> = Vec::new();
+    let mut in_transaction = false;
     
     loop {
         match stream.read(&mut read_buf).await {
@@ -104,18 +112,90 @@ async fn handle_client_async(mut stream: TcpStream) -> std::io::Result<()> {
             if let Some(frame) = opt {
                 if let Some((operation, key, value)) = parse_resp3_command(frame) {
                     // Use spawn_blocking for C++ calls to avoid blocking the async runtime
-                    let op_clone = operation.clone();
-                    let key_clone = key.clone();
-                    let value_clone = value.clone();
+
+                    if operation == "multi" {
+                        in_transaction = true;
+                        pipeline_buffer.clear();
+                        stream.write_all(b"+OK\r\n").await?;
+                        continue;
+                    } else if operation == "exec" {
+                        in_transaction = false;
+                        
+                        // Execute all buffered operations as a batch
+                        if !pipeline_buffer.is_empty() {
+                            let batch_operations = pipeline_buffer.clone();
+                            pipeline_buffer.clear();
+                            
+                            let response = tokio::task::spawn_blocking(move || {
+                                call_cpp_batch_operation(batch_operations)
+                            }).await.map_err(|e| {
+                                std::io::Error::new(std::io::ErrorKind::Other, format!("Blocking task failed: {}", e))
+                            })?;
+                            
+                            let exec_response = format_exec_response_from_batch(&response.result);
+                            stream.write_all(exec_response.as_bytes()).await?;
+                        } else {
+                            // Empty transaction
+                            stream.write_all(b"*0\r\n").await?;
+                        }
+                        continue;
+                    } else if operation == "discard" {
+                        in_transaction = false;
+                        pipeline_buffer.clear();
+                        stream.write_all(b"+OK\r\n").await?;
+                        continue;
+                    } else if operation == "watch" {
+                        // Send watch command as single-item batch to C++ backend
+                        let single_op = vec![(operation.clone(), key.clone(), value.clone())];
+                        
+                        let response = tokio::task::spawn_blocking(move || {
+                            call_cpp_batch_operation(single_op)
+                        }).await.map_err(|e| {
+                            std::io::Error::new(std::io::ErrorKind::Other, format!("Blocking task failed: {}", e))
+                        })?;
+                        
+                        if response.success {
+                            stream.write_all(b"+OK\r\n").await?;
+                        } else {
+                            stream.write_all(b"-ERR watch failed\r\n").await?;
+                        }
+                        continue;
+                    } else if operation == "unwatch" {
+                        // Send unwatch command as single-item batch to C++ backend
+                        let single_op = vec![(operation.clone(), key.clone(), value.clone())];
+                        
+                        let response = tokio::task::spawn_blocking(move || {
+                            call_cpp_batch_operation(single_op)
+                        }).await.map_err(|e| {
+                            std::io::Error::new(std::io::ErrorKind::Other, format!("Blocking task failed: {}", e))
+                        })?;
+                        
+                        if response.success {
+                            stream.write_all(b"+OK\r\n").await?;
+                        } else {
+                            stream.write_all(b"-ERR unwatch failed\r\n").await?;
+                        }
+                        continue;
+                    }
                     
-                    let response = tokio::task::spawn_blocking(move || {
-                        call_cpp_operation(&op_clone, &key_clone, &value_clone)
-                    }).await.map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::Other, format!("Blocking task failed: {}", e))
-                    })?;
-                    
-                    let response_str = format_response(&operation, &response);
-                    stream.write_all(response_str.as_bytes()).await?;
+                    // If in transaction, buffer the command and send QUEUED
+                    if in_transaction {
+                        pipeline_buffer.push((operation, key, value));
+                        stream.write_all(b"+QUEUED\r\n").await?;
+                    } else {
+                        // Execute command immediately as single-item batch
+                        let single_op = vec![(operation.clone(), key.clone(), value.clone())];
+                        
+                        let response = tokio::task::spawn_blocking(move || {
+                            call_cpp_batch_operation(single_op)
+                        }).await.map_err(|e| {
+                            std::io::Error::new(std::io::ErrorKind::Other, format!("Blocking task failed: {}", e))
+                        })?;
+                        
+                        let response_str = format_response(&operation, &response);
+                        // println!("Single operation response: {}", response_str.replace("\r\n", "\\r\\n"));
+                        stream.write_all(response_str.as_bytes()).await?;
+                    }
                 } else {
                     stream.write_all(b"-ERR invalid command format\r\n").await?;
                 }
@@ -129,21 +209,30 @@ async fn handle_client_async(mut stream: TcpStream) -> std::io::Result<()> {
 }
 
 // Direct C++ operation call using spawn_blocking and unified execute function
-fn call_cpp_operation(operation: &str, key: &str, value: &str) -> RustResponse {
+fn call_cpp_batch_operation(operations: Vec<(String, String, String)>) -> RustResponse {
     // Use mutex to ensure thread-safe access to C++ database
     // Note: This runs on a blocking thread pool, not the main async runtime
     let _lock = DATABASE_MUTEX.lock().unwrap();
     
+    let mut batch_data = String::new();
+    for (i, (op, key, val)) in operations.iter().enumerate() {
+        if i > 0 {
+            batch_data.push_str("\r\n");
+        }
+        batch_data.push_str(op);
+        batch_data.push_str("\r\n");
+        batch_data.push_str(key);
+        batch_data.push_str("\r\n");
+        batch_data.push_str(val);
+    }
+
+    // println!("Batch request to C++: {}", batch_data.replace("\r\n", "\\r\\n"));
     unsafe {
-        let op_cstr = std::ffi::CString::new(operation).unwrap();
-        let key_cstr = std::ffi::CString::new(key).unwrap();
-        let value_cstr = std::ffi::CString::new(value).unwrap();
+        let batch_cstr = std::ffi::CString::new(batch_data).unwrap();
         let mut result_ptr: *mut std::os::raw::c_char = std::ptr::null_mut();
         
-        let success = cpp_execute_request_sync(
-            op_cstr.as_ptr(), 
-            key_cstr.as_ptr(), 
-            value_cstr.as_ptr(), 
+        let success = cpp_execute_batch_request_sync(
+            batch_cstr.as_ptr(), 
             &mut result_ptr
         );
         
@@ -299,7 +388,7 @@ fn parse_resp3_command(decoded: DecodedFrame<BytesFrame>) -> Option<(String, Str
         "GET" if parts.len() >= 2 => {
             if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
                 let key_string = String::from_utf8_lossy(key).to_string();
-                Some(("get".to_string(), key_string, String::new()))
+                Some(("get".to_string(), key_string, "nil".to_string()))
             } else {
                 None
             }
@@ -319,7 +408,7 @@ fn parse_resp3_command(decoded: DecodedFrame<BytesFrame>) -> Option<(String, Str
         "INCR" if parts.len() >= 2 => {
             if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
                 let key_string = String::from_utf8_lossy(key).to_string();
-                Some(("incr".to_string(), key_string, String::new()))
+                Some(("incr".to_string(), key_string, "nil".to_string()))
             } else {
                 None
             }
@@ -327,7 +416,7 @@ fn parse_resp3_command(decoded: DecodedFrame<BytesFrame>) -> Option<(String, Str
         "DECR" if parts.len() >= 2 => {
             if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
                 let key_string = String::from_utf8_lossy(key).to_string();
-                Some(("decr".to_string(), key_string, String::new()))
+                Some(("decr".to_string(), key_string, "nil".to_string()))
             } else {
                 None
             }
@@ -398,7 +487,7 @@ fn parse_resp3_command(decoded: DecodedFrame<BytesFrame>) -> Option<(String, Str
         "LPOP" if parts.len() >= 2 => {
             if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
                 let key_string = String::from_utf8_lossy(key).to_string();
-                Some(("lpop".to_string(), key_string, String::new()))
+                Some(("lpop".to_string(), key_string, "nil".to_string()))
             } else {
                 None
             }
@@ -406,7 +495,7 @@ fn parse_resp3_command(decoded: DecodedFrame<BytesFrame>) -> Option<(String, Str
         "RPOP" if parts.len() >= 2 => {
             if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
                 let key_string = String::from_utf8_lossy(key).to_string();
-                Some(("rpop".to_string(), key_string, String::new()))
+                Some(("rpop".to_string(), key_string, "nil".to_string()))
             } else {
                 None
             }
@@ -414,7 +503,7 @@ fn parse_resp3_command(decoded: DecodedFrame<BytesFrame>) -> Option<(String, Str
         "LLEN" if parts.len() >= 2 => {
             if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
                 let key_string = String::from_utf8_lossy(key).to_string();
-                Some(("llen".to_string(), key_string, String::new()))
+                Some(("llen".to_string(), key_string, "nil".to_string()))
             } else {
                 None
             }
@@ -462,7 +551,7 @@ fn parse_resp3_command(decoded: DecodedFrame<BytesFrame>) -> Option<(String, Str
         "HGETALL" if parts.len() >= 2 => {
             if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
                 let key_string = String::from_utf8_lossy(key).to_string();
-                Some(("hgetall".to_string(), key_string, String::new()))
+                Some(("hgetall".to_string(), key_string, "nil".to_string()))
             } else {
                 None
             }
@@ -510,12 +599,12 @@ fn parse_resp3_command(decoded: DecodedFrame<BytesFrame>) -> Option<(String, Str
             }
         }
         "PING" => {
-            Some(("ping".to_string(), String::new(), String::new()))
+            Some(("ping".to_string(), "nil".to_string(), "nil".to_string()))
         }
         "DEL" if parts.len() >= 2 => {
             if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
                 let key_string = String::from_utf8_lossy(key).to_string();
-                Some(("del".to_string(), key_string, String::new()))
+                Some(("del".to_string(), key_string, "nil".to_string()))
             } else {
                 None
             }
@@ -523,7 +612,7 @@ fn parse_resp3_command(decoded: DecodedFrame<BytesFrame>) -> Option<(String, Str
         "EXISTS" if parts.len() >= 2 => {
             if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
                 let key_string = String::from_utf8_lossy(key).to_string();
-                Some(("exists".to_string(), key_string, String::new()))
+                Some(("exists".to_string(), key_string, "nil".to_string()))
             } else {
                 None
             }
@@ -542,7 +631,7 @@ fn parse_resp3_command(decoded: DecodedFrame<BytesFrame>) -> Option<(String, Str
         "TTL" if parts.len() >= 2 => {
             if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
                 let key_string = String::from_utf8_lossy(key).to_string();
-                Some(("ttl".to_string(), key_string, String::new()))
+                Some(("ttl".to_string(), key_string, "nil".to_string()))
             } else {
                 None
             }
@@ -550,7 +639,7 @@ fn parse_resp3_command(decoded: DecodedFrame<BytesFrame>) -> Option<(String, Str
         "KEYS" if parts.len() >= 2 => {
             if let BytesFrame::BlobString { data: pattern, .. } = &parts[1] {
                 let pattern_string = String::from_utf8_lossy(pattern).to_string();
-                Some(("keys".to_string(), pattern_string, String::new()))
+                Some(("keys".to_string(), pattern_string, "nil".to_string()))
             } else {
                 None
             }
@@ -579,7 +668,7 @@ fn parse_resp3_command(decoded: DecodedFrame<BytesFrame>) -> Option<(String, Str
         "SMEMBERS" if parts.len() >= 2 => {
             if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
                 let key_string = String::from_utf8_lossy(key).to_string();
-                Some(("smembers".to_string(), key_string, String::new()))
+                Some(("smembers".to_string(), key_string, "nil".to_string()))
             } else {
                 None
             }
@@ -620,34 +709,32 @@ fn parse_resp3_command(decoded: DecodedFrame<BytesFrame>) -> Option<(String, Str
         "SCARD" if parts.len() >= 2 => {
             if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
                 let key_string = String::from_utf8_lossy(key).to_string();
-                Some(("scard".to_string(), key_string, String::new()))
+                Some(("scard".to_string(), key_string, "nil".to_string()))
             } else {
                 None
             }
         }
         // Basic transaction commands (sequential execution, not true atomicity)
         "MULTI" => {
-            Some(("multi".to_string(), String::new(), String::new()))
+            Some(("multi".to_string(), "nil".to_string(), "nil".to_string()))
         }
         "EXEC" => {
-            Some(("exec".to_string(), String::new(), String::new()))
+            Some(("exec".to_string(), "nil".to_string(), "nil".to_string()))
         }
         "DISCARD" => {
-            Some(("discard".to_string(), String::new(), String::new()))
+            Some(("discard".to_string(), "nil".to_string(), "nil".to_string()))
         }
         "WATCH" if parts.len() >= 2 => {
             if let BytesFrame::BlobString { data: key, .. } = &parts[1] {
                 let key_string = String::from_utf8_lossy(key).to_string();
-                Some(("watch".to_string(), key_string, String::new()))
+                Some(("watch".to_string(), key_string, "nil".to_string()))
             } else {
                 None
             }
         }
         "UNWATCH" => {
-            Some(("unwatch".to_string(), String::new(), String::new()))
+            Some(("unwatch".to_string(), "nil".to_string(), "nil".to_string()))
         }
         _ => None,
     }
 }
-
-// Old wait_for_response function removed - using oneshot channels

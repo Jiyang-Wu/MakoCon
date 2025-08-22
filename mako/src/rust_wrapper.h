@@ -46,6 +46,7 @@ extern RustWrapper* g_rust_wrapper_instance;
 extern "C" {
     bool cpp_execute_request_sync(const char* operation, const char* key, const char* value, char** result);
     void cpp_free_string(char* ptr);
+    bool cpp_execute_batch_request_sync(const char* batch_data, char** result);
 }
 
 #endif
