@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use redis_protocol::resp3::{types::BytesFrame, types::DecodedFrame};
@@ -23,7 +23,6 @@ static DATABASE_MUTEX: Mutex<()> = Mutex::new(());
 extern "C" {
     fn cpp_execute_request_sync(operation: *const std::os::raw::c_char, key: *const std::os::raw::c_char, value: *const std::os::raw::c_char, result: *mut *mut std::os::raw::c_char) -> bool;
     fn cpp_free_string(ptr: *mut std::os::raw::c_char);
-    fn cpp_execute_batch_request_sync(batch_data: *const std::os::raw::c_char, result: *mut *mut std::os::raw::c_char) -> bool;
 }
 
 
@@ -87,11 +86,6 @@ pub extern "C" fn rust_free_string(ptr: *mut std::os::raw::c_char) {
             let _ = std::ffi::CString::from_raw(ptr);
         }
     }
-}
-
-// External C function to notify C++ of new requests
-extern "C" {
-    fn cpp_notify_request_available();
 }
 
 async fn handle_client_async(mut stream: TcpStream) -> std::io::Result<()> {
@@ -213,37 +207,40 @@ fn call_cpp_batch_operation(operations: Vec<(String, String, String)>) -> RustRe
     // Use mutex to ensure thread-safe access to C++ database
     // Note: This runs on a blocking thread pool, not the main async runtime
     let _lock = DATABASE_MUTEX.lock().unwrap();
-    
-    let mut batch_data = String::new();
-    for (i, (op, key, val)) in operations.iter().enumerate() {
-        if i > 0 {
-            batch_data.push_str("\r\n");
-        }
-        batch_data.push_str(op);
-        batch_data.push_str("\r\n");
-        batch_data.push_str(key);
-        batch_data.push_str("\r\n");
-        batch_data.push_str(val);
-    }
 
     // println!("Batch request to C++: {}", batch_data.replace("\r\n", "\\r\\n"));
     unsafe {
-        let batch_cstr = std::ffi::CString::new(batch_data).unwrap();
-        let mut result_ptr: *mut std::os::raw::c_char = std::ptr::null_mut();
+
+        let mut result = String::new();
+        let mut success = true;
+
+        for (i, (op, key, val)) in operations.iter().enumerate() {
+
+            let mut result_ptr: *mut std::os::raw::c_char = std::ptr::null_mut();
+            let op_cstr = std::ffi::CString::new(op.as_str()).unwrap();
+            let key_cstr = std::ffi::CString::new(key.as_str()).unwrap();
+            let value_cstr = std::ffi::CString::new(val.as_str()).unwrap();
+
+            success = cpp_execute_request_sync(
+                op_cstr.as_ptr(), 
+                key_cstr.as_ptr(), 
+                value_cstr.as_ptr(),
+                &mut result_ptr
+            );
+
+            let curr_result = if success && !result_ptr.is_null() {
+                let result_str = std::ffi::CStr::from_ptr(result_ptr).to_string_lossy().to_string();
+                cpp_free_string(result_ptr);
+                result_str
+            } else {
+                String::new()
+            };
         
-        let success = cpp_execute_batch_request_sync(
-            batch_cstr.as_ptr(), 
-            &mut result_ptr
-        );
-        
-        let result = if success && !result_ptr.is_null() {
-            let result_str = std::ffi::CStr::from_ptr(result_ptr).to_string_lossy().to_string();
-            cpp_free_string(result_ptr);
-            result_str
-        } else {
-            String::new()
-        };
-        
+            if i > 0 { result = result + "\r\n"; }
+            result = result + &curr_result;
+            
+        }
+
         RustResponse { result, success }
     }
 }

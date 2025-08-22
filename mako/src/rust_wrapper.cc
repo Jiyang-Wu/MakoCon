@@ -58,50 +58,6 @@ extern "C" {
             free(ptr);
         }
     }
-
-    bool cpp_execute_batch_request_sync(const char* batch_data, char** result) {
-        if (!g_rust_wrapper_instance) {
-            *result = nullptr;
-            return false;
-        }
-        
-        std::string batch_str(batch_data);
-        std::string batch_result = "";
-        int operations_count = 0;
-        
-        vector<string> lines;
-        stringstream ss(batch_str);
-        string line;
-        
-        while (getline(ss, line)) {
-            if (!line.empty() && line.back() == '\r') {
-                line.pop_back();
-            }
-            lines.push_back(line);
-        }
-        // std::cout << "C++ parsed " << lines.size() << " lines:" << std::endl;
-        // for (size_t j = 0; j < lines.size(); j++) {
-        //     std::cout << "  Line " << j << ": '" << lines[j] << "'" << std::endl;
-        // }
-        
-        for (size_t i = 0; i + 2 < lines.size(); i += 3) {
-            string operation = lines[i];
-            string key = lines[i + 1];
-            string value = lines[i + 2];
-            
-            // std::cout << "C++ executing: " << operation << " " << key << " " << value << std::endl;
-            KVStore::Result kv_result = g_rust_wrapper_instance->kv_store_.execute_operation(operation, key, value);
-            
-            if (operations_count > 0) {
-                batch_result += "\r\n";
-            }
-            batch_result += kv_result.value;
-            operations_count++;
-        }
-        
-        *result = strdup(batch_result.c_str());
-        return true;
-    }
 }
 
 
