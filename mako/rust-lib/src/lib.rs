@@ -48,6 +48,25 @@ pub extern "C" fn rust_init() -> bool {
         // Get runtime handle for spawning tasks
         RUNTIME_HANDLE = Some(rt.handle().clone());
 
+        rt.block_on(async {
+            let mut handles = Vec::new();
+            
+            for i in 0..MAX_BLOCKING_THREADS {
+                let handle = tokio::task::spawn_blocking(move || {
+                    let thread_id = std::thread::current().id();
+                    println!("Blocking thread {} created, ID: {:?}", i, thread_id);
+                });
+                handles.push(handle);
+            }
+            
+            // Wait for all blocking tasks to complete
+            for handle in handles {
+                handle.await.unwrap();
+            }
+            
+            println!("All {} blocking threads created", MAX_BLOCKING_THREADS);
+        });
+
         // Spawn async server in background thread with runtime
         std::thread::spawn(move || {
             rt.block_on(async {

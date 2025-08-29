@@ -45,6 +45,7 @@ rm -rf build
 mkdir -p build
 cd build
 cmake ..
+# (for mac) cmake -DCMAKE_OSX_ARCHITECTURES=arm64 ..
 make -j$(nproc)
 cd ../
 ```
