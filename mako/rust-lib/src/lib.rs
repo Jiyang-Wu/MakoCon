@@ -6,7 +6,7 @@ use redis_protocol::resp3::{types::BytesFrame, types::DecodedFrame};
 mod resp3_handler;
 use resp3_handler::Resp3Handler;
 
-const MAX_BLOCKING_THREADS: usize = 4;
+MAX_BLOCKING_THREADS: usize = 4;
 
 // Request and Response structures to match C++ expectations
 #[derive(Debug, Clone)]
@@ -28,8 +28,9 @@ extern "C" {
 
 // Initialize Rust async runtime and channels
 #[no_mangle]
-pub extern "C" fn rust_init() -> bool {
+pub extern "C" fn rust_init(new_max : usize) -> bool {
     unsafe {
+        MAX_BLOCKING_THREADS = new_max;
         // Create async runtime
         let rt = match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
