@@ -6,8 +6,6 @@ use redis_protocol::resp3::{types::BytesFrame, types::DecodedFrame};
 mod resp3_handler;
 use resp3_handler::Resp3Handler;
 
-MAX_BLOCKING_THREADS: usize = 4;
-
 // Request and Response structures to match C++ expectations
 #[derive(Debug, Clone)]
 pub struct RustResponse {
@@ -30,11 +28,11 @@ extern "C" {
 #[no_mangle]
 pub extern "C" fn rust_init(new_max : usize) -> bool {
     unsafe {
-        MAX_BLOCKING_THREADS = new_max;
+        let max_blocking = if new_max == 0 { 4 } else { new_max };
         // Create async runtime
         let rt = match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
-            .max_blocking_threads(MAX_BLOCKING_THREADS)
+            .max_blocking_threads(max_blocking)
             .thread_name("mako-worker")
             .enable_all()
             .build()
@@ -52,7 +50,7 @@ pub extern "C" fn rust_init(new_max : usize) -> bool {
         rt.block_on(async {
             let mut handles = Vec::new();
             
-            for i in 0..MAX_BLOCKING_THREADS {
+            for i in 0..max_blocking {
                 let handle = tokio::task::spawn_blocking(move || {
                     let thread_id = std::thread::current().id();
                     println!("Blocking thread {} created, ID: {:?}", i, thread_id);
@@ -65,7 +63,7 @@ pub extern "C" fn rust_init(new_max : usize) -> bool {
                 handle.await.unwrap();
             }
             
-            println!("All {} blocking threads created", MAX_BLOCKING_THREADS);
+            println!("All {} blocking threads created", max_blocking);
         });
 
         // Spawn async server in background thread with runtime
