@@ -15,7 +15,7 @@ pub struct RustResponse {
 
 // Global state - hybrid approach for FFI compatibility
 static mut RUNTIME_HANDLE: Option<tokio::runtime::Handle> = None;
-static DATABASE_MUTEX: Mutex<()> = Mutex::new(());
+// static DATABASE_MUTEX: Mutex<()> = Mutex::new(());
 
 
 extern "C" {
@@ -224,7 +224,7 @@ async fn handle_client_async(mut stream: TcpStream) -> std::io::Result<()> {
 fn call_cpp_batch_operation(operations: Vec<(String, String, String)>) -> RustResponse {
     // Use mutex to ensure thread-safe access to C++ database
     // Note: This runs on a blocking thread pool, not the main async runtime
-    let _lock = DATABASE_MUTEX.lock().unwrap();
+    // let _lock = DATABASE_MUTEX.lock().unwrap();
 
     // println!("Batch request to C++: {}", batch_data.replace("\r\n", "\\r\\n"));
     unsafe {

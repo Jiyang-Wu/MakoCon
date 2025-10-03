@@ -1,5 +1,8 @@
 // Build: g++ bench.cpp -O3 -std=gnu++17 -lhiredis -lpthread -o bench
 
+// redis-server --port 6379 --io-threads 8 --io-threads-do-reads yes
+// redis-cli -h 127.0.0.1 -p 6379 SHUTDOWN
+
 // Basically:
 //      Spawns a (#number) of clients on their own connections,
 //      for each client during a given (#time interval)
@@ -34,7 +37,7 @@ struct Target {
 
 struct Args {
     Target t1;                         // redis by default
-    Target t2{"custom", "127.0.0.1", 6380};
+    Target t2{"mako", "127.0.0.1", 6380};
     uint64_t keys{1000000};
     int warmup_sec{10};
     std::vector<int> clients{16, 32, 64};
@@ -306,6 +309,7 @@ struct BenchEngine {
 
         for (int v : a.values) {
             for (int c : a.clients) {
+                std::cout << "[RUN] clients=" << c << " (GET+SET for " << a.t1.name << " & " << a.t2.name << ")\n" << std::flush;
                 {
                     WorkerCfg cfg1{a.t1, "get", a.keys, v, a.duration, 0xC0FFEE};
                     Stats s1 = run_workers_no_pipeline(cfg1, c);
