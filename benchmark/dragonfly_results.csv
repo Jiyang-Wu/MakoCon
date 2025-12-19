@@ -1,0 +1,7 @@
+server,host,port,workload,key_dist,threads,value_size,duration_sec,total_ops,ops_per_sec,ops_per_sec_per_thread,p50_us,p95_us,p99_us
+dragonfly,127.0.0.1,6390,get,1-to-10-byte-decimal,1,8,60.00,1170749,19512.48,19512.48,49.31,52.10,65.51
+dragonfly,127.0.0.1,6390,get,1-to-10-byte-decimal,4,8,60.00,5291277,88187.95,22046.99,55.34,84.48,87.83
+dragonfly,127.0.0.1,6390,get,1-to-10-byte-decimal,16,8,60.00,6015418,100256.97,6266.06,160.66,209.26,333.50
+dragonfly,127.0.0.1,6390,put,1-to-10-byte-decimal,1,8,60.00,1091456,18190.93,18190.93,53.06,55.76,64.00
+dragonfly,127.0.0.1,6390,put,1-to-10-byte-decimal,4,8,60.00,4954579,82576.32,20644.08,60.06,91.74,93.21
+dragonfly,127.0.0.1,6390,put,1-to-10-byte-decimal,16,8,60.00,5750629,95843.82,5990.24,165.24,221.53,235.44

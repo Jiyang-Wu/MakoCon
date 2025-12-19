@@ -1,0 +1,7 @@
+server,host,port,workload,key_dist,threads,value_size,duration_sec,total_ops,ops_per_sec,ops_per_sec_per_thread,p50_us,p95_us,p99_us
+mako,127.0.0.1,6380,get,1-to-10-byte-decimal,1,8,59.90,1242299,20739.55,20739.55,0.00,0.00,0.00
+mako,127.0.0.1,6380,get,1-to-10-byte-decimal,4,8,59.90,4921066,82153.32,20538.33,0.00,0.00,0.00
+mako,127.0.0.1,6380,get,1-to-10-byte-decimal,16,8,59.90,5204749,86884.83,5430.30,0.00,0.00,0.00
+mako,127.0.0.1,6380,put,1-to-10-byte-decimal,1,8,59.90,1233210,20587.81,20587.81,0.00,0.00,0.00
+mako,127.0.0.1,6380,put,1-to-10-byte-decimal,4,8,59.90,4833518,80691.77,20172.94,0.00,0.00,0.00
+mako,127.0.0.1,6380,put,1-to-10-byte-decimal,16,8,33.59,2885759,85906.14,5369.13,0.00,0.00,0.00
