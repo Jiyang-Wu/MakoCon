@@ -37,23 +37,15 @@ The system supports Redis-compatible commands with the format: `{operation}:{key
 - netcat (for testing)
 
 ### Build Steps
-
-```bash
-# Create build directory and configure
+```
 cd mako
-rm -rf build
-mkdir -p build
-cd build
-cmake ..
-# (for mac) cmake -DCMAKE_OSX_ARCHITECTURES=arm64 ..
-make -j$(nproc)
-cd ../
+make
 ```
 
 ### Start the Server
 
 ```bash
-./build/mako_server
+./build/makoCon
 ```
 
 The server will:
