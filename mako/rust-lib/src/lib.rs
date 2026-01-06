@@ -1,10 +1,11 @@
-use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::io::BufWriter;
-use tokio::io::AsyncWrite;
-use bytes::{Bytes, BytesMut};
+use std::net::{TcpListener, TcpStream, SocketAddr};
+use std::io::{Read, Write, BufWriter};
+use bytes::Bytes;
 use redis_protocol::resp3::{types::BytesFrame, types::DecodedFrame};
-use redis_protocol::error::RedisProtocolError;
+use socket2::{Socket, Domain, Type, Protocol};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Barrier;
 
 mod resp3_handler;
 use resp3_handler::Resp3Handler;
@@ -20,6 +21,9 @@ extern "C" {
 
     // free buffer returned by cpp_execute_request (if any)
     fn cpp_free_buf(ptr: *mut u8, len: usize);
+
+    // Called when each worker thread starts to initialize C++ thread-local state
+    fn cpp_worker_thread_init(thread_id: usize);
 }
 
 #[derive(Copy, Clone)]
@@ -97,33 +101,33 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Option<Command> {
     }
 }
 
-// ===== RESP writers (no big String formatting) =====
+// ===== RESP writers (synchronous, no async) =====
 
 #[inline]
-async fn write_simple_ok<W: AsyncWrite + Unpin>(stream: &mut W) -> std::io::Result<()> {
-    stream.write_all(b"+OK\r\n").await
+fn write_simple_ok<W: Write>(stream: &mut W) -> std::io::Result<()> {
+    stream.write_all(b"+OK\r\n")
 }
 
 #[inline]
-async fn write_nil_bulk<W: AsyncWrite + Unpin>(stream: &mut W) -> std::io::Result<()> {
-    stream.write_all(b"$-1\r\n").await
+fn write_nil_bulk<W: Write>(stream: &mut W) -> std::io::Result<()> {
+    stream.write_all(b"$-1\r\n")
 }
 
 #[inline]
-async fn write_bulk<W: AsyncWrite + Unpin>(stream: &mut W, data: &[u8]) -> std::io::Result<()> {
+fn write_bulk<W: Write>(stream: &mut W, data: &[u8]) -> std::io::Result<()> {
     let mut buf = itoa::Buffer::new();
-    stream.write_all(b"$").await?;
-    stream.write_all(buf.format(data.len()).as_bytes()).await?;
-    stream.write_all(b"\r\n").await?;
-    stream.write_all(data).await?;
-    stream.write_all(b"\r\n").await
+    stream.write_all(b"$")?;
+    stream.write_all(buf.format(data.len()).as_bytes())?;
+    stream.write_all(b"\r\n")?;
+    stream.write_all(data)?;
+    stream.write_all(b"\r\n")
 }
 
 #[inline]
-async fn write_err<W: AsyncWrite + Unpin>(stream: &mut W, msg: &str) -> std::io::Result<()> {
-    stream.write_all(b"-ERR ").await?;
-    stream.write_all(msg.as_bytes()).await?;
-    stream.write_all(b"\r\n").await
+fn write_err<W: Write>(stream: &mut W, msg: &str) -> std::io::Result<()> {
+    stream.write_all(b"-ERR ")?;
+    stream.write_all(msg.as_bytes())?;
+    stream.write_all(b"\r\n")
 }
 
 // ===== FFI bridge for GET/SET =====
@@ -165,89 +169,133 @@ fn ffi_getset(cmd: &Command) -> Result<Option<&'static [u8]>, ()> {
 
 // ===== Runtime + server =====
 
+/// Creates a TcpListener with SO_REUSEPORT enabled (blocking mode).
+/// This allows multiple sockets to bind to the same port, each with its own
+/// kernel accept queue, enabling true parallel accept scaling.
+fn create_reuseport_listener(addr: &str) -> std::io::Result<TcpListener> {
+    let addr: SocketAddr = addr.parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    socket.set_reuse_port(true)?;  // Key: enables multiple sockets on same port
+    socket.set_nonblocking(false)?; // BLOCKING mode for synchronous I/O
+    socket.set_nodelay(true)?;      // Disable Nagle's algorithm
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;           // Backlog of 1024 pending connections
+
+    Ok(TcpListener::from(socket))
+}
+
+/// Thread-per-core architecture: Each OS thread has its own isolated socket.
+/// 100% SYNCHRONOUS - no async, no Tokio runtime, pure blocking I/O.
+///
+/// Architecture:
+/// ```text
+///   OS Thread 0                 OS Thread 1                 OS Thread 2
+///   ┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
+///   │ Blocking Socket │         │ Blocking Socket │         │ Blocking Socket │
+///   │ (SO_REUSEPORT)  │         │ (SO_REUSEPORT)  │         │ (SO_REUSEPORT)  │
+///   │                 │         │                 │         │                 │
+///   │ accept() blocks │         │ accept() blocks │         │ accept() blocks │
+///   │ read() blocks   │         │ read() blocks   │         │ read() blocks   │
+///   │ write() blocks  │         │ write() blocks  │         │ write() blocks  │
+///   └─────────────────┘         └─────────────────┘         └─────────────────┘
+///           │                           │                           │
+///           └───────────────────────────┴───────────────────────────┘
+///                                       │
+///                              Port 6380 (kernel distributes)
+/// ```
 #[no_mangle]
 pub extern "C" fn rust_init(n_threads: usize) -> bool {
-    let max_blocking = 4;
+    let addr = "127.0.0.1:6380";
 
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(n_threads)                 // single-thread event loop like Redis
-        .max_blocking_threads(max_blocking)
-        .thread_name("mako-worker")
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => { eprintln!("Failed to create tokio runtime: {e}"); return false; }
-    };
+    // Barrier to synchronize all worker threads before accepting
+    let barrier = Arc::new(Barrier::new(n_threads));
 
-    std::thread::spawn(move || {
-        rt.block_on(async {
-            if let Err(e) = start_async_server().await {
-                eprintln!("Async server error: {e}");
-            }
-        });
-    });
+    // Counter for ready threads
+    let ready_count = Arc::new(AtomicUsize::new(0));
+
+    println!("Starting {} thread-per-core workers on {} (SO_REUSEPORT, 100% SYNC)",
+             n_threads, addr);
+
+    for thread_id in 0..n_threads {
+        let barrier = Arc::clone(&barrier);
+        let ready_count = Arc::clone(&ready_count);
+        let addr = addr.to_string();
+
+        std::thread::Builder::new()
+            .name(format!("mako-worker-{}", thread_id))
+            .spawn(move || {
+                // Each thread creates its OWN listener with SO_REUSEPORT
+                let listener = match create_reuseport_listener(&addr) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!("[thread-{}] Failed to create listener: {e}", thread_id);
+                        return;
+                    }
+                };
+
+                // === Per-thread C++ initialization ===
+                // Initialize C++ thread-local state (mbta_type::thread_init, etc.)
+                unsafe { cpp_worker_thread_init(thread_id); }
+
+                // Mark this thread as ready
+                let count = ready_count.fetch_add(1, Ordering::SeqCst) + 1;
+
+                // Wait for all threads to be ready
+                barrier.wait();
+
+                if thread_id == 0 {
+                    println!("All {} threads ready, accepting connections on {}",
+                             count, addr);
+                }
+
+                // Accept loop - 100% synchronous, blocking I/O
+                loop {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            if let Err(e) = stream.set_nodelay(true) {
+                                eprintln!("Failed to set TCP_NODELAY: {e}");
+                            }
+
+                            // Handle client SYNCHRONOUSLY - blocks until done
+                            if let Err(e) = handle_client_sync(&mut stream) {
+                                eprintln!("Client handling error: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[thread-{}] Accept error: {e}", thread_id);
+                        }
+                    }
+                }
+            })
+            .expect("Failed to spawn worker thread");
+    }
 
     true
 }
 
-async fn start_async_server() -> std::io::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:6380").await?;
-    println!("Async Rust server started on 127.0.0.1:6380");
-
-    let use_db = true;
-
-    loop {
-        let (stream, _) = listener.accept().await?;
-        if let Err(e) = stream.set_nodelay(true) {
-            eprintln!("Failed to set TCP_NODELAY: {e}");
-        }
-        tokio::spawn({
-            let use_db = use_db;
-            async move {
-                let res = if use_db {
-                    handle_client_async(stream).await      // original, with DB
-                } else {
-                    handle_client_async_nodb(stream).await // new, no DB
-                };
-                if let Err(e) = res {
-                    eprintln!("Client handling error: {e}");
-                }
-            }
-        });
-    }
-}
-
-async fn handle_client_async(stream: TcpStream) -> std::io::Result<()> {
+/// Handle a client connection synchronously (100% blocking).
+/// All reads, writes, and C++ calls block the thread until complete.
+fn handle_client_sync(stream: &mut TcpStream) -> std::io::Result<()> {
     let mut resp3 = Resp3Handler::new(10 * 1024 * 1024);
-    
-    // Buffer size choice: 16KB read buffer
-    // Reference: Redis uses PROTO_IOBUF_LEN = 16384 (16KB) in networking.c
-    // See: https://github.com/redis/redis/blob/unstable/src/networking.c
-    // Rationale: Large enough to read many pipelined commands in one syscall,
-    // but small enough to avoid excessive memory overhead per client
+
+    // Buffer size choice: 16KB read buffer (matches Redis PROTO_IOBUF_LEN)
     let mut read_buf = [0u8; 16384];
 
-    // Split stream into reader and writer, wrap writer in buffer
-    let (mut reader, writer) = stream.into_split();
-    
-    // Buffer size choice: 16KB write buffer
-    // Reference: Redis uses PROTO_REPLY_CHUNK_BYTES = 16384 for reply buffers
-    // See: https://github.com/redis/redis/blob/unstable/src/networking.c
-    // Rationale: Batches multiple responses together to amortize syscall overhead.
-    // With redis-benchmark -P 1000, this allows ~100-200 responses per flush
-    // depending on response sizes (simple OK vs bulk strings)
-    let mut writer = BufWriter::with_capacity(16384, writer);
+    // Buffer size choice: 16KB write buffer (matches Redis PROTO_REPLY_CHUNK_BYTES)
+    let mut writer = BufWriter::with_capacity(16384, stream.try_clone()?);
 
     loop {
-        // Read once - in pipelined mode this may contain hundreds of commands
-        match reader.read(&mut read_buf).await {
-            Ok(0) => break,
+        // BLOCKING read - waits until data arrives
+        match stream.read(&mut read_buf) {
+            Ok(0) => break,  // Connection closed
             Ok(n) => resp3.read_bytes(&read_buf[..n]),
             Err(e) => return Err(e),
         }
 
-        // CRITICAL CHANGE: Process ALL available frames without intermediate flushes
+        // Process ALL available frames
         loop {
             match resp3.next_frame() {
                 Ok(Some(frame)) => {
@@ -255,91 +303,38 @@ async fn handle_client_async(stream: TcpStream) -> std::io::Result<()> {
                         match cmd.op {
                             OpCode::Get => {
                                 match ffi_getset(&cmd) {
-                                    Err(_) => write_err(&mut writer, "backend").await?,
-                                    Ok(None) => write_nil_bulk(&mut writer).await?,
+                                    Err(_) => write_err(&mut writer, "backend")?,
+                                    Ok(None) => write_nil_bulk(&mut writer)?,
                                     Ok(Some(bytes)) => {
-                                        write_bulk(&mut writer, bytes).await?;
+                                        write_bulk(&mut writer, bytes)?;
                                         unsafe { cpp_free_buf(bytes.as_ptr() as *mut u8, bytes.len()) };
                                     }
                                 }
                             }
                             OpCode::Set => {
                                 match ffi_getset(&cmd) {
-                                    Err(_) => write_err(&mut writer, "backend").await?,
-                                    Ok(_)  => write_simple_ok(&mut writer).await?,
+                                    Err(_) => write_err(&mut writer, "backend")?,
+                                    Ok(_)  => write_simple_ok(&mut writer)?,
                                 }
                             }
                             _ => unreachable!(),
                         }
                     } else {
-                        write_err(&mut writer, "unsupported command").await?;
+                        write_err(&mut writer, "unsupported command")?;
                     }
                 }
-                Ok(None) => break,  // No more complete frames available
+                Ok(None) => break,  // No more complete frames
                 Err(_) => {
-                    write_err(&mut writer, "protocol error").await?;
-                    break;
-                }
-            }
-        }
-        
-        // CRITICAL CHANGE: Single flush after processing entire batch
-        // Original code flushed every 100 operations AND after each read batch.
-        // New behavior: Only flush after exhausting all parseable frames from current buffer.
-        // This matches Redis's event loop pattern and is essential for pipeline performance.
-        writer.flush().await?;
-    }
-    
-    Ok(())
-}
-
-async fn handle_client_async_nodb(stream: TcpStream) -> std::io::Result<()> {
-    let mut resp3 = Resp3Handler::new(10 * 1024 * 1024);
-    let mut read_buf = [0u8; 16384];
-
-    let (mut reader, writer) = stream.into_split();
-    let mut writer = BufWriter::with_capacity(16384, writer);
-
-    // Dummy value to return for GET hits (8 bytes, like your -d 8)
-    const DUMMY_VALUE: &[u8] = b"AAAAAAAA";
-
-    loop {
-        // Read a batch of pipelined commands
-        match reader.read(&mut read_buf).await {
-            Ok(0) => break,
-            Ok(n) => resp3.read_bytes(&read_buf[..n]),
-            Err(e) => return Err(e),
-        }
-
-        loop {
-            match resp3.next_frame() {
-                Ok(Some(frame)) => {
-                    if let Some(cmd) = parse_resp3(frame) {
-                        match cmd.op {
-                            OpCode::Get => {
-                                write_bulk(&mut writer, DUMMY_VALUE).await?;
-                            }
-                            OpCode::Set => {
-                                write_simple_ok(&mut writer).await?;
-                            }
-                            _ => {
-                                write_err(&mut writer, "unsupported command").await?;
-                            }
-                        }
-                    } else {
-                        write_err(&mut writer, "unsupported command").await?;
-                    }
-                }
-                Ok(None) => break,
-                Err(_) => {
-                    write_err(&mut writer, "protocol error").await?;
+                    write_err(&mut writer, "protocol error")?;
                     break;
                 }
             }
         }
 
-        writer.flush().await?;
+        // BLOCKING flush - waits until all data sent
+        writer.flush()?;
     }
 
     Ok(())
 }
+
